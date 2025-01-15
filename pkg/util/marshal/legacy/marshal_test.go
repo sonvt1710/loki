@@ -9,9 +9,9 @@ import (
 	json "github.com/json-iterator/go"
 	"github.com/stretchr/testify/require"
 
-	loghttp "github.com/grafana/loki/pkg/loghttp/legacy"
-	"github.com/grafana/loki/pkg/logproto"
-	"github.com/grafana/loki/pkg/logqlmodel"
+	loghttp "github.com/grafana/loki/v3/pkg/loghttp/legacy"
+	"github.com/grafana/loki/v3/pkg/logproto"
+	"github.com/grafana/loki/v3/pkg/logqlmodel"
 )
 
 // covers responses from /api/prom/query
@@ -27,6 +27,14 @@ var queryTests = []struct {
 						Timestamp: mustParse(time.RFC3339Nano, "2019-09-13T18:32:22.380001319Z"),
 						Line:      "super line",
 					},
+					{
+						Timestamp: mustParse(time.RFC3339Nano, "2019-09-13T18:32:23.380001319Z"),
+						Line:      "super line with labels",
+						StructuredMetadata: []logproto.LabelAdapter{
+							{Name: "foo", Value: "a"},
+							{Name: "bar", Value: "b"},
+						},
+					},
 				},
 				Labels: `{test="test"}`,
 			},
@@ -39,22 +47,39 @@ var queryTests = []struct {
 						{
 							"ts": "2019-09-13T18:32:22.380001319Z",
 							"line": "super line"
+						},
+						{
+							"ts": "2019-09-13T18:32:23.380001319Z",
+							"line": "super line with labels"
 						}
 					]
 				}
 			],
 			"stats" : {
+				"index": {
+					"postFilterChunks": 0,
+					"totalChunks": 0,
+					"usedBloomFilters": false,
+					"shardsDuration": 0
+				},
 				"ingester" : {
 					"store": {
 						"chunksDownloadTime": 0,
+						"congestionControlLatency": 0,
 						"totalChunksRef": 0,
 						"totalChunksDownloaded": 0,
+						"chunkRefsFetchTime": 0,
+						"queryReferencedStructuredMetadata": false,
+				 		"pipelineWrapperFilteredLines": 0,
 						"chunk" :{
 							"compressedBytes": 0,
 							"decompressedBytes": 0,
 							"decompressedLines": 0,
+							"decompressedStructuredMetadataBytes": 0,
 							"headChunkBytes": 0,
 							"headChunkLines": 0,
+							"headChunkStructuredMetadataBytes": 0,
+							"postFilterLines": 0,
 							"totalDuplicates": 0
 						}
 					},
@@ -66,14 +91,21 @@ var queryTests = []struct {
 				"querier": {
 					"store": {
 						"chunksDownloadTime": 0,
+						"congestionControlLatency": 0,
 						"totalChunksRef": 0,
 						"totalChunksDownloaded": 0,
+						"chunkRefsFetchTime": 0,
+						"queryReferencedStructuredMetadata": false,
+				                "pipelineWrapperFilteredLines": 0,
 						"chunk" :{
 							"compressedBytes": 0,
 							"decompressedBytes": 0,
 							"decompressedLines": 0,
+							"decompressedStructuredMetadataBytes": 0,
 							"headChunkBytes": 0,
 							"headChunkLines": 0,
+							"headChunkStructuredMetadataBytes": 0,
+							"postFilterLines": 0,
 							"totalDuplicates": 0
 						}
 					}
@@ -85,7 +117,9 @@ var queryTests = []struct {
 						"entriesStored": 0,
 						"bytesReceived": 0,
 						"bytesSent": 0,
-						"requests": 0
+						"requests": 0,
+						"downloadTime": 0,
+						"queryLengthServed": 0
 					},
 					"index": {
 						"entriesFound": 0,
@@ -93,7 +127,59 @@ var queryTests = []struct {
 						"entriesStored": 0,
 						"bytesReceived": 0,
 						"bytesSent": 0,
-						"requests": 0
+						"requests": 0,
+						"downloadTime": 0,
+						"queryLengthServed": 0
+					},
+					"statsResult": {
+						"entriesFound": 0,
+						"entriesRequested": 0,
+						"entriesStored": 0,
+						"bytesReceived": 0,
+						"bytesSent": 0,
+						"requests": 0,
+						"downloadTime": 0,
+						"queryLengthServed": 0
+					},
+					"seriesResult": {
+						"entriesFound": 0,
+						"entriesRequested": 0,
+						"entriesStored": 0,
+						"bytesReceived": 0,
+						"bytesSent": 0,
+						"requests": 0,
+						"downloadTime": 0,
+						"queryLengthServed": 0
+					},
+					"labelResult": {
+						"entriesFound": 0,
+						"entriesRequested": 0,
+						"entriesStored": 0,
+						"bytesReceived": 0,
+						"bytesSent": 0,
+						"requests": 0,
+						"downloadTime": 0,
+						"queryLengthServed": 0
+					},
+					"volumeResult": {
+						"entriesFound": 0,
+						"entriesRequested": 0,
+						"entriesStored": 0,
+						"bytesReceived": 0,
+						"bytesSent": 0,
+						"requests": 0,
+						"downloadTime": 0,
+						"queryLengthServed": 0
+					},
+					"instantMetricResult": {
+						"entriesFound": 0,
+						"entriesRequested": 0,
+						"entriesStored": 0,
+						"bytesReceived": 0,
+						"bytesSent": 0,
+						"requests": 0,
+						"downloadTime": 0,
+						"queryLengthServed": 0
 					},
 					"result": {
 						"entriesFound": 0,
@@ -101,7 +187,9 @@ var queryTests = []struct {
 						"entriesStored": 0,
 						"bytesReceived": 0,
 						"bytesSent": 0,
-						"requests": 0
+						"requests": 0,
+						"downloadTime": 0,
+						"queryLengthServed": 0
 					}
 				},
 				"summary": {
@@ -109,10 +197,14 @@ var queryTests = []struct {
 					"execTime": 0,
 					"linesProcessedPerSecond": 0,
 					"queueTime": 0,
+                    "shards": 0,
+                    "splits": 0,
 					"subqueries": 0,
-					"totalBytesProcessed":0,
-                                        "totalEntriesReturned":0,
-					"totalLinesProcessed":0
+					"totalBytesProcessed": 0,
+                    "totalEntriesReturned": 0,
+					"totalLinesProcessed": 0,
+					"totalStructuredMetadataBytesProcessed": 0,
+                    "totalPostFilterLines": 0
 				}
 			}
 		}`,
@@ -150,6 +242,14 @@ var tailTests = []struct {
 							Timestamp: mustParse(time.RFC3339Nano, "2019-09-13T18:32:22.380001319Z"),
 							Line:      "super line",
 						},
+						{
+							Timestamp: mustParse(time.RFC3339Nano, "2019-09-13T18:32:23.380001319Z"),
+							Line:      "super line with labels",
+							StructuredMetadata: []logproto.LabelAdapter{
+								{Name: "foo", Value: "a"},
+								{Name: "bar", Value: "b"},
+							},
+						},
 					},
 					Labels: "{test=\"test\"}",
 				},
@@ -169,6 +269,10 @@ var tailTests = []struct {
 						{
 							"ts": "2019-09-13T18:32:22.380001319Z",
 							"line": "super line"
+						},
+						{
+							"ts": "2019-09-13T18:32:23.380001319Z",
+							"line": "super line with labels"
 						}
 					]
 				}

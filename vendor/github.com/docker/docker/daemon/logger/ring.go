@@ -1,11 +1,10 @@
 package logger // import "github.com/docker/docker/daemon/logger"
 
 import (
+	"context"
 	"errors"
 	"sync"
 	"sync/atomic"
-
-	"github.com/sirupsen/logrus"
 )
 
 const (
@@ -19,21 +18,25 @@ type RingLogger struct {
 	l         Logger
 	logInfo   Info
 	closeFlag int32
+	wg        sync.WaitGroup
 }
 
-var _ SizedLogger = &RingLogger{}
+var (
+	_ SizedLogger = (*RingLogger)(nil)
+	_ LogReader   = (*ringWithReader)(nil)
+)
 
 type ringWithReader struct {
 	*RingLogger
 }
 
-func (r *ringWithReader) ReadLogs(cfg ReadConfig) *LogWatcher {
+func (r *ringWithReader) ReadLogs(ctx context.Context, cfg ReadConfig) *LogWatcher {
 	reader, ok := r.l.(LogReader)
 	if !ok {
 		// something is wrong if we get here
 		panic("expected log reader")
 	}
-	return reader.ReadLogs(cfg)
+	return reader.ReadLogs(ctx, cfg)
 }
 
 func newRingLogger(driver Logger, logInfo Info, maxSize int64) *RingLogger {
@@ -42,6 +45,7 @@ func newRingLogger(driver Logger, logInfo Info, maxSize int64) *RingLogger {
 		l:       driver,
 		logInfo: logInfo,
 	}
+	l.wg.Add(1)
 	go l.run()
 	return l
 }
@@ -93,6 +97,7 @@ func (r *RingLogger) setClosed() {
 func (r *RingLogger) Close() error {
 	r.setClosed()
 	r.buffer.Close()
+	r.wg.Wait()
 	// empty out the queue
 	var logErr bool
 	for _, msg := range r.buffer.Drain() {
@@ -104,10 +109,7 @@ func (r *RingLogger) Close() error {
 		}
 
 		if err := r.l.Log(msg); err != nil {
-			logrus.WithField("driver", r.l.Name()).
-				WithField("container", r.logInfo.ContainerID).
-				WithError(err).
-				Errorf("Error writing log message")
+			logDriverError(r.l.Name(), string(msg.Line), err)
 			logErr = true
 		}
 	}
@@ -118,6 +120,7 @@ func (r *RingLogger) Close() error {
 // logger.
 // This is run in a goroutine when the RingLogger is created
 func (r *RingLogger) run() {
+	defer r.wg.Done()
 	for {
 		if r.closed() {
 			return
@@ -128,10 +131,7 @@ func (r *RingLogger) run() {
 			return
 		}
 		if err := r.l.Log(msg); err != nil {
-			logrus.WithField("driver", r.l.Name()).
-				WithField("container", r.logInfo.ContainerID).
-				WithError(err).
-				Errorf("Error writing log message")
+			logDriverError(r.l.Name(), string(msg.Line), err)
 		}
 	}
 }
@@ -142,7 +142,7 @@ type messageRing struct {
 	wait *sync.Cond
 
 	sizeBytes int64 // current buffer size
-	maxBytes  int64 // max buffer size size
+	maxBytes  int64 // max buffer size
 	queue     []*Message
 	closed    bool
 }

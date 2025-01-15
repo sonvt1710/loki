@@ -21,7 +21,7 @@ import (
 	"strings"
 	"time"
 
-	btpb "google.golang.org/genproto/googleapis/bigtable/v2"
+	btpb "cloud.google.com/go/bigtable/apiv2/bigtablepb"
 )
 
 // A Filter represents a row filter.
@@ -142,6 +142,18 @@ func (lnf latestNFilter) String() string { return fmt.Sprintf("col(*,%d)", lnf) 
 
 func (lnf latestNFilter) proto() *btpb.RowFilter {
 	return &btpb.RowFilter{Filter: &btpb.RowFilter_CellsPerColumnLimitFilter{CellsPerColumnLimitFilter: int32(lnf)}}
+}
+
+// LabelFilter returns a filter that applies the
+// given label to all cells in the output row.
+func LabelFilter(label string) Filter { return labelFilter(label) }
+
+type labelFilter string
+
+func (lf labelFilter) String() string { return fmt.Sprintf("apply_label(%s)", string(lf)) }
+
+func (lf labelFilter) proto() *btpb.RowFilter {
+	return &btpb.RowFilter{Filter: &btpb.RowFilter_ApplyLabelTransformer{ApplyLabelTransformer: string(lf)}}
 }
 
 // StripValueFilter returns a filter that replaces each value with the empty string.

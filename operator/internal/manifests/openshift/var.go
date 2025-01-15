@@ -2,6 +2,15 @@ package openshift
 
 import (
 	"fmt"
+	"time"
+)
+
+const (
+	annotationGatewayRouteTimeout = "haproxy.router.openshift.io/timeout"
+
+	gatewayRouteTimeoutExtension = 15 * time.Second
+
+	dashboardPrometheusRulesName = "lokistack-dashboard-rules"
 )
 
 var (
@@ -36,6 +45,9 @@ var (
 	MonitoringSVCMain = "alertmanager-main"
 	// MonitoringSVCOperated is the name of the alertmanager operator service used for alerts.
 	MonitoringSVCOperated = "alertmanager-operated"
+
+	MonitoringSVCUserWorkload = "alertmanager-user-workload"
+	MonitoringUserWorkloadNS  = "openshift-user-workload-monitoring"
 )
 
 func authorizerRbacName(componentName string) string {

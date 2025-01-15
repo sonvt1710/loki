@@ -6,6 +6,7 @@ package journal
 import (
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -19,10 +20,10 @@ import (
 	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v2"
 
-	"github.com/grafana/loki/clients/pkg/promtail/client/fake"
-	"github.com/grafana/loki/clients/pkg/promtail/positions"
-	"github.com/grafana/loki/clients/pkg/promtail/scrapeconfig"
-	"github.com/grafana/loki/clients/pkg/promtail/targets/testutils"
+	"github.com/grafana/loki/v3/clients/pkg/promtail/client/fake"
+	"github.com/grafana/loki/v3/clients/pkg/promtail/positions"
+	"github.com/grafana/loki/v3/clients/pkg/promtail/scrapeconfig"
+	"github.com/grafana/loki/v3/clients/pkg/promtail/targets/testutils"
 )
 
 type mockJournalReader struct {
@@ -38,13 +39,13 @@ func (r *mockJournalReader) Close() error {
 	return nil
 }
 
-func (r *mockJournalReader) Follow(until <-chan time.Time, writer io.Writer) error {
+func (r *mockJournalReader) Follow(until <-chan time.Time, _ io.Writer) error {
 	<-until
 	return nil
 }
 
 func newMockJournalEntry(entry *sdjournal.JournalEntry) journalEntryFunc {
-	return func(c sdjournal.JournalReaderConfig, cursor string) (*sdjournal.JournalEntry, error) {
+	return func(_ sdjournal.JournalReaderConfig, _ string) (*sdjournal.JournalEntry, error) {
 		return entry, nil
 	}
 }
@@ -70,7 +71,7 @@ func TestJournalTarget(t *testing.T) {
 	logger := log.NewLogfmtLogger(w)
 
 	testutils.InitRandom()
-	dirName := "/tmp/" + testutils.RandName()
+	dirName := filepath.Join(os.TempDir(), testutils.RandName())
 	positionsFileName := dirName + "/positions.yml"
 
 	// Set the sync period to a really long value, to guarantee the sync timer
@@ -132,7 +133,7 @@ func TestJournalTargetParsingErrors(t *testing.T) {
 	logger := log.NewLogfmtLogger(w)
 
 	testutils.InitRandom()
-	dirName := "/tmp/" + testutils.RandName()
+	dirName := filepath.Join(os.TempDir(), testutils.RandName())
 	positionsFileName := dirName + "/positions.yml"
 
 	// Set the sync period to a really long value, to guarantee the sync timer
@@ -200,7 +201,7 @@ func TestJournalTarget_JSON(t *testing.T) {
 	logger := log.NewLogfmtLogger(w)
 
 	testutils.InitRandom()
-	dirName := "/tmp/" + testutils.RandName()
+	dirName := filepath.Join(os.TempDir(), testutils.RandName())
 	positionsFileName := dirName + "/positions.yml"
 
 	// Set the sync period to a really long value, to guarantee the sync timer
@@ -260,7 +261,7 @@ func TestJournalTarget_Since(t *testing.T) {
 	logger := log.NewLogfmtLogger(w)
 
 	testutils.InitRandom()
-	dirName := "/tmp/" + testutils.RandName()
+	dirName := filepath.Join(os.TempDir(), testutils.RandName())
 	positionsFileName := dirName + "/positions.yml"
 
 	// Set the sync period to a really long value, to guarantee the sync timer
@@ -294,7 +295,7 @@ func TestJournalTarget_Cursor_TooOld(t *testing.T) {
 	logger := log.NewLogfmtLogger(w)
 
 	testutils.InitRandom()
-	dirName := "/tmp/" + testutils.RandName()
+	dirName := filepath.Join(os.TempDir(), testutils.RandName())
 	positionsFileName := dirName + "/positions.yml"
 
 	// Set the sync period to a really long value, to guarantee the sync timer
@@ -334,7 +335,7 @@ func TestJournalTarget_Cursor_NotTooOld(t *testing.T) {
 	logger := log.NewLogfmtLogger(w)
 
 	testutils.InitRandom()
-	dirName := "/tmp/" + testutils.RandName()
+	dirName := filepath.Join(os.TempDir(), testutils.RandName())
 	positionsFileName := dirName + "/positions.yml"
 
 	// Set the sync period to a really long value, to guarantee the sync timer
@@ -391,7 +392,7 @@ func TestJournalTarget_Matches(t *testing.T) {
 	logger := log.NewLogfmtLogger(w)
 
 	testutils.InitRandom()
-	dirName := "/tmp/" + testutils.RandName()
+	dirName := filepath.Join(os.TempDir(), testutils.RandName())
 	positionsFileName := dirName + "/positions.yml"
 
 	// Set the sync period to a really long value, to guarantee the sync timer

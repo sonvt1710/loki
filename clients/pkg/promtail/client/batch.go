@@ -2,7 +2,8 @@ package client
 
 import (
 	"fmt"
-	"sort"
+	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -10,9 +11,9 @@ import (
 	"github.com/golang/snappy"
 	"github.com/prometheus/common/model"
 
-	"github.com/grafana/loki/clients/pkg/promtail/api"
+	"github.com/grafana/loki/v3/clients/pkg/promtail/api"
 
-	"github.com/grafana/loki/pkg/logproto"
+	"github.com/grafana/loki/v3/pkg/logproto"
 )
 
 const (
@@ -50,7 +51,7 @@ func newBatch(maxStreams int, entries ...api.Entry) *batch {
 
 // add an entry to the batch
 func (b *batch) add(entry api.Entry) error {
-	b.bytes += len(entry.Line)
+	b.bytes += entrySize(entry)
 
 	// Append the entry to an already existing stream (if any)
 	labels := labelsMapToString(entry.Labels, ReservedLabelTenantID)
@@ -71,20 +72,36 @@ func (b *batch) add(entry api.Entry) error {
 	return nil
 }
 
-func labelsMapToString(ls model.LabelSet, without ...model.LabelName) string {
-	lstrs := make([]string, 0, len(ls))
-Outer:
+func labelsMapToString(ls model.LabelSet, without model.LabelName) string {
+	var b strings.Builder
+	totalSize := 2
+	lstrs := make([]model.LabelName, 0, len(ls))
+
 	for l, v := range ls {
-		for _, w := range without {
-			if l == w {
-				continue Outer
-			}
+		if l == without {
+			continue
 		}
-		lstrs = append(lstrs, fmt.Sprintf("%s=%q", l, v))
+
+		lstrs = append(lstrs, l)
+		// guess size increase: 2 for `, ` between labels and 3 for the `=` and quotes around label value
+		totalSize += len(l) + 2 + len(v) + 3
 	}
 
-	sort.Strings(lstrs)
-	return fmt.Sprintf("{%s}", strings.Join(lstrs, ", "))
+	b.Grow(totalSize)
+	b.WriteByte('{')
+	slices.Sort(lstrs)
+	for i, l := range lstrs {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+
+		b.WriteString(string(l))
+		b.WriteString(`=`)
+		b.WriteString(strconv.Quote(string(ls[l])))
+	}
+	b.WriteByte('}')
+
+	return b.String()
 }
 
 // sizeBytes returns the current batch size in bytes
@@ -95,7 +112,7 @@ func (b *batch) sizeBytes() int {
 // sizeBytesAfter returns the size of the batch after the input entry
 // will be added to the batch itself
 func (b *batch) sizeBytesAfter(entry api.Entry) int {
-	return b.bytes + len(entry.Line)
+	return b.bytes + entrySize(entry)
 }
 
 // age of the batch since its creation
@@ -127,4 +144,12 @@ func (b *batch) createPushRequest() (*logproto.PushRequest, int) {
 		entriesCount += len(stream.Entries)
 	}
 	return &req, entriesCount
+}
+
+func entrySize(entry api.Entry) int {
+	structuredMetadataSize := 0
+	for _, label := range entry.StructuredMetadata {
+		structuredMetadataSize += label.Size()
+	}
+	return len(entry.Line) + structuredMetadataSize
 }
