@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -13,18 +14,20 @@ import (
 
 	"github.com/go-kit/log"
 	"github.com/grafana/dskit/flagext"
+	"github.com/grafana/dskit/server"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/model/relabel"
 	"github.com/stretchr/testify/require"
-	"github.com/weaveworks/common/server"
 
-	"github.com/grafana/loki/clients/pkg/promtail/api"
-	"github.com/grafana/loki/clients/pkg/promtail/client"
-	"github.com/grafana/loki/clients/pkg/promtail/client/fake"
-	"github.com/grafana/loki/clients/pkg/promtail/scrapeconfig"
+	"github.com/grafana/loki/pkg/push"
 
-	"github.com/grafana/loki/pkg/logproto"
+	"github.com/grafana/loki/v3/clients/pkg/promtail/api"
+	"github.com/grafana/loki/v3/clients/pkg/promtail/client"
+	"github.com/grafana/loki/v3/clients/pkg/promtail/client/fake"
+	"github.com/grafana/loki/v3/clients/pkg/promtail/scrapeconfig"
+
+	"github.com/grafana/loki/v3/pkg/logproto"
 )
 
 const localhost = "127.0.0.1"
@@ -84,8 +87,8 @@ func TestLokiPushTarget(t *testing.T) {
 		BatchWait: 1 * time.Second,
 		BatchSize: 100 * 1024,
 	}
-	m := client.NewMetrics(prometheus.DefaultRegisterer, nil)
-	pc, err := client.New(m, ccfg, nil, 0, logger)
+	m := client.NewMetrics(prometheus.DefaultRegisterer)
+	pc, err := client.New(m, ccfg, 0, 0, false, logger)
 	require.NoError(t, err)
 	defer pc.Stop()
 
@@ -100,6 +103,10 @@ func TestLokiPushTarget(t *testing.T) {
 			Entry: logproto.Entry{
 				Timestamp: time.Unix(int64(i), 0),
 				Line:      "line" + strconv.Itoa(i),
+				StructuredMetadata: push.LabelsAdapter{
+					{Name: "i", Value: strconv.Itoa(i)},
+					{Name: "anotherMetaData", Value: "val"},
+				},
 			},
 		}
 	}
@@ -121,6 +128,13 @@ func TestLokiPushTarget(t *testing.T) {
 	}
 	// Spot check the first value in the result to make sure relabel rules were applied properly
 	require.Equal(t, expectedLabels, eh.Received()[0].Labels)
+
+	expectedStructuredMetadata := push.LabelsAdapter{
+		{Name: "i", Value: strconv.Itoa(0)},
+		{Name: "anotherMetaData", Value: "val"},
+	}
+	// Spot check the first value in the result to make sure structured metadata was received properly
+	require.Equal(t, expectedStructuredMetadata, eh.Received()[0].StructuredMetadata)
 
 	// With keep timestamp enabled, verify timestamp
 	require.Equal(t, time.Unix(99, 0).Unix(), eh.Received()[99].Timestamp.Unix())
@@ -199,4 +213,68 @@ func TestPlaintextPushTarget(t *testing.T) {
 
 	_ = pt.Stop()
 
+}
+
+func TestReady(t *testing.T) {
+	w := log.NewSyncWriter(os.Stderr)
+	logger := log.NewLogfmtLogger(w)
+
+	//Create PushTarget
+	eh := fake.New(func() {})
+	defer eh.Stop()
+
+	// Get a randomly available port by open and closing a TCP socket
+	addr, err := net.ResolveTCPAddr("tcp", localhost+":0")
+	require.NoError(t, err)
+	l, err := net.ListenTCP("tcp", addr)
+	require.NoError(t, err)
+	port := l.Addr().(*net.TCPAddr).Port
+	err = l.Close()
+	require.NoError(t, err)
+
+	// Adjust some of the defaults
+	defaults := server.Config{}
+	defaults.RegisterFlags(flag.NewFlagSet("empty", flag.ContinueOnError))
+	defaults.HTTPListenAddress = localhost
+	defaults.HTTPListenPort = port
+	defaults.GRPCListenAddress = localhost
+	defaults.GRPCListenPort = 0 // Not testing GRPC, a random port will be assigned
+
+	config := &scrapeconfig.PushTargetConfig{
+		Server: defaults,
+		Labels: model.LabelSet{
+			"pushserver": "pushserver2",
+			"keepme":     "label",
+		},
+		KeepTimestamp: true,
+	}
+
+	pt, err := NewPushTarget(logger, eh, []*relabel.Config{}, "job3", config)
+	require.NoError(t, err)
+
+	url := fmt.Sprintf("http://%s:%d/ready", localhost, port)
+	response, err := http.Get(url)
+	if err != nil {
+		require.NoError(t, err)
+	}
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		require.NoError(t, err)
+	}
+	responseCode := fmt.Sprint(response.StatusCode)
+	responseBody := string(body)
+
+	fmt.Println(responseBody)
+	wantedResponse := "ready"
+	if responseBody != wantedResponse {
+		t.Errorf("got the response %q, want %q", responseBody, wantedResponse)
+	}
+	wantedCode := "200"
+	if responseCode != wantedCode {
+		t.Errorf("Got the response code %q, want %q", responseCode, wantedCode)
+	}
+
+	t.Cleanup(func() {
+		_ = pt.Stop()
+	})
 }

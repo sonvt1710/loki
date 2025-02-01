@@ -58,6 +58,11 @@ type PrefixType struct {
 	Prefix string `json:"prefix"`
 }
 
+type PutBucketArgs struct {
+	TagList       string `json:"-"`
+	EnableMultiAz bool   `json:"enableMultiAz"`
+}
+
 // ListObjectsResult defines the result structure of ListObjects api.
 type ListObjectsResult struct {
 	Name           string              `json:"name"`
@@ -93,6 +98,7 @@ type AclRefererType struct {
 type AclCondType struct {
 	IpAddress []string       `json:"ipAddress"`
 	Referer   AclRefererType `json:"referer"`
+	VpcId     []string       `json:"vpcId"`
 }
 
 // GrantType defines the grant struct in ACL setting
@@ -102,6 +108,7 @@ type GrantType struct {
 	Resource    []string      `json:"resource,omitempty"`
 	NotResource []string      `json:"notResource,omitempty"`
 	Condition   AclCondType   `json:"condition,omitempty"`
+	Effect      string        `json:"effect,omitempty"`
 }
 
 // PutBucketAclArgs defines the input args structure for putting bucket acl.
@@ -125,7 +132,7 @@ type PutBucketLoggingArgs struct {
 type GetBucketLoggingResult struct {
 	Status       string `json:"status"`
 	TargetBucket string `json:"targetBucket,omitempty"`
-	TargetPrefix string `json:"targetPrefix, omitempty"`
+	TargetPrefix string `json:"targetPrefix,omitempty"`
 }
 
 // LifecycleConditionTimeType defines the structure of time condition
@@ -171,18 +178,20 @@ type StorageClassType struct {
 type BucketReplicationDescriptor struct {
 	Bucket       string `json:"bucket,omitempty"`
 	StorageClass string `json:"storageClass,omitempty"`
+	Prefix       string `json:"prefix,omitempty"`
 }
 
 // BucketReplicationType defines the data structure for Put and Get of bucket replication
 type BucketReplicationType struct {
-	Id               string                       `json:"id"`
-	Status           string                       `json:"status"`
-	Resource         []string                     `json:"resource"`
-	ReplicateDeletes string                       `json:"replicateDeletes"`
-	Destination      *BucketReplicationDescriptor `json:"destination,omitempty"`
-	ReplicateHistory *BucketReplicationDescriptor `json:"replicateHistory,omitempty"`
-	CreateTime       int64                        `json:"createTime"`
-	DestRegion       string                       `json:"destRegion"`
+	Id                 string                       `json:"id"`
+	Status             string                       `json:"status"`
+	Resource           []string                     `json:"resource"`
+	NotIncludeResource []string                     `json:"notIncludeResource,omitempty"`
+	ReplicateDeletes   string                       `json:"replicateDeletes"`
+	Destination        *BucketReplicationDescriptor `json:"destination,omitempty"`
+	ReplicateHistory   *BucketReplicationDescriptor `json:"replicateHistory,omitempty"`
+	CreateTime         int64                        `json:"createTime"`
+	DestRegion         string                       `json:"destRegion"`
 }
 
 type PutBucketReplicationArgs BucketReplicationType
@@ -258,6 +267,9 @@ type PutObjectArgs struct {
 	ContentCrc32       string
 	StorageClass       string
 	Process            string
+	CannedAcl          string
+	ObjectTagging      string
+	TrafficLimit       int64
 }
 
 // CopyObjectArgs defines the optional args structure for the copy object api.
@@ -268,10 +280,23 @@ type CopyObjectArgs struct {
 	IfNoneMatch       string
 	IfModifiedSince   string
 	IfUnmodifiedSince string
+	TrafficLimit      int64
+	CannedAcl         string
+	TaggingDirective  string
 }
 
 type MultiCopyObjectArgs struct {
-	StorageClass string
+	StorageClass     string
+	ObjectTagging    string
+	TaggingDirective string
+}
+
+type CallbackResult struct {
+	Result string `json:"result"`
+}
+
+type PutObjectResult struct {
+	Callback CallbackResult `json:"callback"`
 }
 
 // CopyObjectResult defines the result json structure for the copy object api.
@@ -320,8 +345,8 @@ type SelectObjectResult struct {
 
 // selectObject request args
 type SelectObjectArgs struct {
-	SelectType    string               `json: "-"`
-	SelectRequest *SelectObjectRequest `json: "selectRequest"`
+	SelectType    string               `json:"-"`
+	SelectRequest *SelectObjectRequest `json:"selectRequest"`
 }
 
 type SelectObjectRequest struct {
@@ -372,8 +397,9 @@ type EndMessage struct {
 
 // FetchObjectArgs defines the optional arguments structure for the fetch object api.
 type FetchObjectArgs struct {
-	FetchMode    string
-	StorageClass string
+	FetchMode            string
+	StorageClass         string
+	FetchCallBackAddress string
 }
 
 // FetchObjectResult defines the result json structure for the fetch object api.
@@ -396,6 +422,7 @@ type AppendObjectArgs struct {
 	ContentSha256      string
 	ContentCrc32       string
 	StorageClass       string
+	TrafficLimit       int64
 }
 
 // AppendObjectResult defines the result data structure for appending object.
@@ -434,6 +461,8 @@ type InitiateMultipartUploadArgs struct {
 	ContentDisposition string
 	Expires            string
 	StorageClass       string
+	ObjectTagging      string
+	TaggingDirective   string
 }
 
 // InitiateMultipartUploadResult defines the result structure to initiate a multipart upload.
@@ -448,6 +477,7 @@ type UploadPartArgs struct {
 	ContentMD5    string
 	ContentSha256 string
 	ContentCrc32  string
+	TrafficLimit  int64
 }
 
 // UploadPartCopyArgs defines the optional arguments of UploadPartCopy.
@@ -457,12 +487,14 @@ type UploadPartCopyArgs struct {
 	IfNoneMatch       string
 	IfModifiedSince   string
 	IfUnmodifiedSince string
+	TrafficLimit      int64
 }
 
 type PutSymlinkArgs struct {
 	ForbidOverwrite string
 	StorageClass    string
 	UserMeta        map[string]string
+	SymlinkBucket   string
 }
 
 // UploadInfoType defines an uploaded part info structure.
@@ -576,4 +608,80 @@ type PutBucketNotificationAppsSt struct {
 	Id       string `json:"id"`
 	EventUrl string `json:"eventUrl"`
 	XVars    string `json:"xVars"`
+}
+
+type MirrorConfigurationRule struct {
+	Prefix          string       `json:"prefix,omitempty"`
+	SourceUrl       string       `json:"sourceUrl"`
+	PassQueryString bool         `json:"passQuerystring"`
+	Mode            string       `json:"mode"`
+	StorageClass    string       `json:"storageClass"`
+	PassHeaders     []string     `json:"passHeaders"`
+	IgnoreHeaders   []string     `json:"ignoreHeaders"`
+	CustomHeaders   []HeaderPair `json:"customHeaders"`
+	BackSourceUrl   string       `json:"backSourceUrl"`
+	Resource        string       `json:"resource"`
+	Suffix          string       `json:"suffix"`
+	FixedKey        string       `json:"fixedKey"`
+	PrefixReplace   string       `json:"prefixReplace"`
+	Version         string       `json:"version"`
+}
+
+type HeaderPair struct {
+	HeaderName  string `json:"headerName"`
+	HeaderValue string `json:"headerValue"`
+}
+
+type PutBucketMirrorArgs struct {
+	BucketMirroringConfiguration []MirrorConfigurationRule `json:"bucketMirroringConfiguration"`
+}
+
+type PutBucketTagArgs struct {
+	Tags []Tag `json:"tags"`
+}
+
+type Tag struct {
+	TagKey   string `json:"tagKey"`
+	TagValue string `json:"tagValue"`
+}
+
+type GetBucketTagResult struct {
+	Tags []BucketTag `json:"tag"`
+}
+
+type BucketTag struct {
+	TagKey   string `json:"tag_key"`
+	TagValue string `json:"tag_value"`
+}
+
+type BosContext struct {
+	Bucket          string
+	PathStyleEnable bool
+}
+
+type PutObjectTagArgs struct {
+	ObjectTags []ObjectTags `json:"tagSet"`
+}
+
+type ObjectTags struct {
+	TagInfo []ObjectTag `json:"tagInfo"`
+}
+
+type ObjectTag struct {
+	Key   string `json:"key"`
+	Value string `json:"value"`
+}
+
+type BosShareLinkArgs struct {
+	Bucket          string `json:"bucket"`
+	Endpoint        string `json:"endpoint"`
+	Prefix          string `json:"prefix"`
+	ShareCode       string `json:"shareCode"`
+	DurationSeconds int64  `json:"durationSeconds"`
+}
+
+type BosShareResBody struct {
+	ShareUrl       string `json:"shareUrl"`
+	LinkExpireTime int64  `json:"linkExpireTime"`
+	ShareCode      string `json:"shareCode"`
 }

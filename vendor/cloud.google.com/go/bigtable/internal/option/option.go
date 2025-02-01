@@ -22,9 +22,11 @@ import (
 	"fmt"
 	"os"
 
+	"cloud.google.com/go/bigtable/internal"
 	"cloud.google.com/go/internal/version"
 	gax "github.com/googleapis/gax-go/v2"
 	"google.golang.org/api/option"
+	"google.golang.org/api/option/internaloption"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/metadata"
 )
@@ -54,6 +56,8 @@ func withGoogleClientInfo() metadata.MD {
 		gax.Version,
 		"grpc",
 		grpc.Version,
+		"gccl",
+		internal.Version,
 	}
 	return metadata.Pairs("x-goog-api-client", gax.XGoogHeader(kv...))
 }
@@ -76,19 +80,20 @@ func unaryInterceptor(ctx context.Context, method string, req, reply interface{}
 
 // DefaultClientOptions returns the default client options to use for the
 // client's gRPC connection.
-func DefaultClientOptions(endpoint, scope, userAgent string) ([]option.ClientOption, error) {
+func DefaultClientOptions(endpoint, mtlsEndpoint, scope, userAgent string) ([]option.ClientOption, error) {
 	var o []option.ClientOption
 	// Check the environment variables for the bigtable emulator.
 	// Dial it directly and don't pass any credentials.
 	if addr := os.Getenv("BIGTABLE_EMULATOR_HOST"); addr != "" {
 		conn, err := grpc.Dial(addr, grpc.WithInsecure())
 		if err != nil {
-			return nil, fmt.Errorf("emulator grpc.Dial: %v", err)
+			return nil, fmt.Errorf("emulator grpc.Dial: %w", err)
 		}
 		o = []option.ClientOption{option.WithGRPCConn(conn)}
 	} else {
 		o = []option.ClientOption{
-			option.WithEndpoint(endpoint),
+			internaloption.WithDefaultEndpointTemplate(endpoint),
+			internaloption.WithDefaultMTLSEndpoint(mtlsEndpoint),
 			option.WithScopes(scope),
 			option.WithUserAgent(userAgent),
 		}

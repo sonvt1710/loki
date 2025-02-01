@@ -7,12 +7,13 @@ import (
 	fmt "fmt"
 	_ "github.com/gogo/protobuf/gogoproto"
 	proto "github.com/gogo/protobuf/proto"
+	_ "github.com/gogo/protobuf/types"
 	github_com_gogo_protobuf_types "github.com/gogo/protobuf/types"
-	types "github.com/gogo/protobuf/types"
 	_ "github.com/golang/protobuf/ptypes/duration"
-	github_com_grafana_loki_pkg_logproto "github.com/grafana/loki/pkg/logproto"
-	logproto "github.com/grafana/loki/pkg/logproto"
-	definitions "github.com/grafana/loki/pkg/querier/queryrange/queryrangebase/definitions"
+	github_com_grafana_loki_v3_pkg_logproto "github.com/grafana/loki/v3/pkg/logproto"
+	logproto "github.com/grafana/loki/v3/pkg/logproto"
+	definitions "github.com/grafana/loki/v3/pkg/querier/queryrange/queryrangebase/definitions"
+	resultscache "github.com/grafana/loki/v3/pkg/storage/chunk/cache/resultscache"
 	io "io"
 	math "math"
 	math_bits "math/bits"
@@ -35,12 +36,12 @@ const _ = proto.GoGoProtoPackageIsVersion3 // please upgrade the proto package
 
 type PrometheusRequest struct {
 	Path           string                                 `protobuf:"bytes,1,opt,name=path,proto3" json:"path,omitempty"`
-	Start          int64                                  `protobuf:"varint,2,opt,name=start,proto3" json:"start,omitempty"`
-	End            int64                                  `protobuf:"varint,3,opt,name=end,proto3" json:"end,omitempty"`
+	Start          time.Time                              `protobuf:"bytes,2,opt,name=start,proto3,stdtime" json:"start"`
+	End            time.Time                              `protobuf:"bytes,3,opt,name=end,proto3,stdtime" json:"end"`
 	Step           int64                                  `protobuf:"varint,4,opt,name=step,proto3" json:"step,omitempty"`
 	Timeout        time.Duration                          `protobuf:"bytes,5,opt,name=timeout,proto3,stdduration" json:"timeout"`
 	Query          string                                 `protobuf:"bytes,6,opt,name=query,proto3" json:"query,omitempty"`
-	CachingOptions definitions.CachingOptions             `protobuf:"bytes,7,opt,name=cachingOptions,proto3" json:"cachingOptions"`
+	CachingOptions resultscache.CachingOptions            `protobuf:"bytes,7,opt,name=cachingOptions,proto3" json:"cachingOptions"`
 	Headers        []*definitions.PrometheusRequestHeader `protobuf:"bytes,8,rep,name=Headers,proto3" json:"-"`
 }
 
@@ -83,18 +84,18 @@ func (m *PrometheusRequest) GetPath() string {
 	return ""
 }
 
-func (m *PrometheusRequest) GetStart() int64 {
+func (m *PrometheusRequest) GetStart() time.Time {
 	if m != nil {
 		return m.Start
 	}
-	return 0
+	return time.Time{}
 }
 
-func (m *PrometheusRequest) GetEnd() int64 {
+func (m *PrometheusRequest) GetEnd() time.Time {
 	if m != nil {
 		return m.End
 	}
-	return 0
+	return time.Time{}
 }
 
 func (m *PrometheusRequest) GetStep() int64 {
@@ -118,11 +119,11 @@ func (m *PrometheusRequest) GetQuery() string {
 	return ""
 }
 
-func (m *PrometheusRequest) GetCachingOptions() definitions.CachingOptions {
+func (m *PrometheusRequest) GetCachingOptions() resultscache.CachingOptions {
 	if m != nil {
 		return m.CachingOptions
 	}
-	return definitions.CachingOptions{}
+	return resultscache.CachingOptions{}
 }
 
 func (m *PrometheusRequest) GetHeaders() []*definitions.PrometheusRequestHeader {
@@ -138,6 +139,7 @@ type PrometheusResponse struct {
 	ErrorType string                                  `protobuf:"bytes,3,opt,name=ErrorType,proto3" json:"errorType,omitempty"`
 	Error     string                                  `protobuf:"bytes,4,opt,name=Error,proto3" json:"error,omitempty"`
 	Headers   []*definitions.PrometheusResponseHeader `protobuf:"bytes,5,rep,name=Headers,proto3" json:"-"`
+	Warnings  []string                                `protobuf:"bytes,6,rep,name=Warnings,proto3" json:"warnings,omitempty"`
 }
 
 func (m *PrometheusResponse) Reset()      { *m = PrometheusResponse{} }
@@ -207,6 +209,13 @@ func (m *PrometheusResponse) GetHeaders() []*definitions.PrometheusResponseHeade
 	return nil
 }
 
+func (m *PrometheusResponse) GetWarnings() []string {
+	if m != nil {
+		return m.Warnings
+	}
+	return nil
+}
+
 type PrometheusData struct {
 	ResultType string         `protobuf:"bytes,1,opt,name=ResultType,proto3" json:"resultType"`
 	Result     []SampleStream `protobuf:"bytes,2,rep,name=Result,proto3" json:"result"`
@@ -259,8 +268,8 @@ func (m *PrometheusData) GetResult() []SampleStream {
 }
 
 type SampleStream struct {
-	Labels  []github_com_grafana_loki_pkg_logproto.LabelAdapter `protobuf:"bytes,1,rep,name=labels,proto3,customtype=github.com/grafana/loki/pkg/logproto.LabelAdapter" json:"metric"`
-	Samples []logproto.LegacySample                             `protobuf:"bytes,2,rep,name=samples,proto3" json:"values"`
+	Labels  []github_com_grafana_loki_v3_pkg_logproto.LabelAdapter `protobuf:"bytes,1,rep,name=labels,proto3,customtype=github.com/grafana/loki/v3/pkg/logproto.LabelAdapter" json:"metric"`
+	Samples []logproto.LegacySample                                `protobuf:"bytes,2,rep,name=samples,proto3" json:"values"`
 }
 
 func (m *SampleStream) Reset()      { *m = SampleStream{} }
@@ -302,132 +311,11 @@ func (m *SampleStream) GetSamples() []logproto.LegacySample {
 	return nil
 }
 
-type CachedResponse struct {
-	Key string `protobuf:"bytes,1,opt,name=key,proto3" json:"key"`
-	// List of cached responses; non-overlapping and in order.
-	Extents []Extent `protobuf:"bytes,2,rep,name=extents,proto3" json:"extents"`
-}
-
-func (m *CachedResponse) Reset()      { *m = CachedResponse{} }
-func (*CachedResponse) ProtoMessage() {}
-func (*CachedResponse) Descriptor() ([]byte, []int) {
-	return fileDescriptor_4cc6a0c1d6b614c4, []int{4}
-}
-func (m *CachedResponse) XXX_Unmarshal(b []byte) error {
-	return m.Unmarshal(b)
-}
-func (m *CachedResponse) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
-	if deterministic {
-		return xxx_messageInfo_CachedResponse.Marshal(b, m, deterministic)
-	} else {
-		b = b[:cap(b)]
-		n, err := m.MarshalToSizedBuffer(b)
-		if err != nil {
-			return nil, err
-		}
-		return b[:n], nil
-	}
-}
-func (m *CachedResponse) XXX_Merge(src proto.Message) {
-	xxx_messageInfo_CachedResponse.Merge(m, src)
-}
-func (m *CachedResponse) XXX_Size() int {
-	return m.Size()
-}
-func (m *CachedResponse) XXX_DiscardUnknown() {
-	xxx_messageInfo_CachedResponse.DiscardUnknown(m)
-}
-
-var xxx_messageInfo_CachedResponse proto.InternalMessageInfo
-
-func (m *CachedResponse) GetKey() string {
-	if m != nil {
-		return m.Key
-	}
-	return ""
-}
-
-func (m *CachedResponse) GetExtents() []Extent {
-	if m != nil {
-		return m.Extents
-	}
-	return nil
-}
-
-type Extent struct {
-	Start    int64      `protobuf:"varint,1,opt,name=start,proto3" json:"start"`
-	End      int64      `protobuf:"varint,2,opt,name=end,proto3" json:"end"`
-	TraceId  string     `protobuf:"bytes,4,opt,name=trace_id,json=traceId,proto3" json:"-"`
-	Response *types.Any `protobuf:"bytes,5,opt,name=response,proto3" json:"response"`
-}
-
-func (m *Extent) Reset()      { *m = Extent{} }
-func (*Extent) ProtoMessage() {}
-func (*Extent) Descriptor() ([]byte, []int) {
-	return fileDescriptor_4cc6a0c1d6b614c4, []int{5}
-}
-func (m *Extent) XXX_Unmarshal(b []byte) error {
-	return m.Unmarshal(b)
-}
-func (m *Extent) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
-	if deterministic {
-		return xxx_messageInfo_Extent.Marshal(b, m, deterministic)
-	} else {
-		b = b[:cap(b)]
-		n, err := m.MarshalToSizedBuffer(b)
-		if err != nil {
-			return nil, err
-		}
-		return b[:n], nil
-	}
-}
-func (m *Extent) XXX_Merge(src proto.Message) {
-	xxx_messageInfo_Extent.Merge(m, src)
-}
-func (m *Extent) XXX_Size() int {
-	return m.Size()
-}
-func (m *Extent) XXX_DiscardUnknown() {
-	xxx_messageInfo_Extent.DiscardUnknown(m)
-}
-
-var xxx_messageInfo_Extent proto.InternalMessageInfo
-
-func (m *Extent) GetStart() int64 {
-	if m != nil {
-		return m.Start
-	}
-	return 0
-}
-
-func (m *Extent) GetEnd() int64 {
-	if m != nil {
-		return m.End
-	}
-	return 0
-}
-
-func (m *Extent) GetTraceId() string {
-	if m != nil {
-		return m.TraceId
-	}
-	return ""
-}
-
-func (m *Extent) GetResponse() *types.Any {
-	if m != nil {
-		return m.Response
-	}
-	return nil
-}
-
 func init() {
 	proto.RegisterType((*PrometheusRequest)(nil), "queryrangebase.PrometheusRequest")
 	proto.RegisterType((*PrometheusResponse)(nil), "queryrangebase.PrometheusResponse")
 	proto.RegisterType((*PrometheusData)(nil), "queryrangebase.PrometheusData")
 	proto.RegisterType((*SampleStream)(nil), "queryrangebase.SampleStream")
-	proto.RegisterType((*CachedResponse)(nil), "queryrangebase.CachedResponse")
-	proto.RegisterType((*Extent)(nil), "queryrangebase.Extent")
 }
 
 func init() {
@@ -435,59 +323,55 @@ func init() {
 }
 
 var fileDescriptor_4cc6a0c1d6b614c4 = []byte{
-	// 824 bytes of a gzipped FileDescriptorProto
-	0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0x8c, 0x54, 0x4f, 0x6f, 0x1b, 0x45,
-	0x14, 0xf7, 0xc4, 0xff, 0x27, 0x95, 0x5b, 0xa6, 0x55, 0xd9, 0xb4, 0x68, 0xd7, 0xb2, 0x40, 0x0a,
-	0x12, 0x5d, 0x8b, 0x20, 0xb8, 0x15, 0x91, 0x4d, 0x82, 0x68, 0x55, 0x89, 0x6a, 0xc2, 0x89, 0x0b,
-	0x1a, 0x7b, 0x5f, 0x36, 0xab, 0xec, 0xbf, 0xce, 0xcc, 0x56, 0xf8, 0xc6, 0x89, 0x33, 0x47, 0x3e,
-	0x02, 0x07, 0xc4, 0xe7, 0x88, 0x38, 0xe5, 0x58, 0x71, 0x58, 0x88, 0x73, 0x41, 0x7b, 0xea, 0x47,
-	0x40, 0x33, 0xb3, 0x6b, 0xaf, 0x5d, 0x15, 0xb8, 0xd8, 0xef, 0xcf, 0xef, 0xbd, 0x79, 0xbf, 0xdf,
-	0xcc, 0x3e, 0xfc, 0x59, 0x76, 0x11, 0x4c, 0x5f, 0xe4, 0xc0, 0x43, 0xe0, 0xfa, 0x7f, 0xc1, 0x59,
-	0x12, 0x40, 0xc3, 0x9c, 0x31, 0xd1, 0x74, 0xdd, 0x8c, 0xa7, 0x32, 0x25, 0xa3, 0x4d, 0xc0, 0x83,
-	0x47, 0x41, 0x28, 0xcf, 0xf3, 0x99, 0x3b, 0x4f, 0xe3, 0x69, 0x90, 0x06, 0xe9, 0x54, 0xc3, 0x66,
-	0xf9, 0x99, 0xf6, 0xb4, 0xa3, 0x2d, 0x53, 0xfe, 0x60, 0x2f, 0x48, 0xd3, 0x20, 0x82, 0x35, 0x8a,
-	0x25, 0x8b, 0x2a, 0x65, 0x6f, 0xa7, 0xfc, 0x9c, 0x33, 0x19, 0xa6, 0x49, 0x95, 0x7f, 0xa8, 0x26,
-	0x8e, 0xd2, 0xc0, 0xf4, 0xac, 0x8d, 0x2a, 0x79, 0xf4, 0xff, 0xe8, 0xf8, 0x70, 0x16, 0x26, 0xa1,
-	0x6a, 0x2a, 0x9a, 0xb6, 0x69, 0x32, 0xf9, 0x7d, 0x07, 0xbf, 0xf3, 0x9c, 0xa7, 0x31, 0xc8, 0x73,
-	0xc8, 0x05, 0x85, 0x17, 0x39, 0x08, 0x49, 0x08, 0xee, 0x64, 0x4c, 0x9e, 0x5b, 0x68, 0x8c, 0xf6,
-	0x87, 0x54, 0xdb, 0xe4, 0x1e, 0xee, 0x0a, 0xc9, 0xb8, 0xb4, 0x76, 0xc6, 0x68, 0xbf, 0x4d, 0x8d,
-	0x43, 0xee, 0xe0, 0x36, 0x24, 0xbe, 0xd5, 0xd6, 0x31, 0x65, 0xaa, 0x5a, 0x21, 0x21, 0xb3, 0x3a,
-	0x3a, 0xa4, 0x6d, 0xf2, 0x18, 0xf7, 0x65, 0x18, 0x43, 0x9a, 0x4b, 0xab, 0x3b, 0x46, 0xfb, 0xbb,
-	0x07, 0x7b, 0xae, 0x61, 0xee, 0xd6, 0xcc, 0xdd, 0xe3, 0x8a, 0xb9, 0x37, 0xb8, 0x2c, 0x9c, 0xd6,
-	0xcf, 0x7f, 0x3a, 0x88, 0xd6, 0x35, 0xea, 0x68, 0x4d, 0xca, 0xea, 0xe9, 0x79, 0x8c, 0x43, 0x9e,
-	0xe0, 0xd1, 0x9c, 0xcd, 0xcf, 0xc3, 0x24, 0xf8, 0x3a, 0xd3, 0x94, 0xac, 0xbe, 0xee, 0xfd, 0xd0,
-	0x6d, 0xd2, 0x3c, 0xda, 0x80, 0x78, 0x1d, 0xd5, 0x9d, 0x6e, 0x15, 0x92, 0x13, 0xdc, 0xff, 0x0a,
-	0x98, 0x0f, 0x5c, 0x58, 0x83, 0x71, 0x7b, 0x7f, 0xf7, 0xe0, 0xfd, 0x8d, 0x1e, 0x6f, 0x08, 0x64,
-	0xc0, 0x5e, 0xb7, 0x2c, 0x1c, 0xf4, 0x88, 0xd6, 0xb5, 0x93, 0xdf, 0x76, 0x30, 0x69, 0x62, 0x45,
-	0x96, 0x26, 0x02, 0xc8, 0x04, 0xf7, 0x4e, 0x25, 0x93, 0xb9, 0x30, 0x7a, 0x7a, 0xb8, 0x2c, 0x9c,
-	0x9e, 0xd0, 0x11, 0x5a, 0x65, 0xc8, 0x53, 0xdc, 0x39, 0x66, 0x92, 0x69, 0x71, 0x77, 0x0f, 0x6c,
-	0x77, 0xf3, 0x12, 0x1b, 0x13, 0x28, 0x94, 0x77, 0x5f, 0xb1, 0x28, 0x0b, 0x67, 0xe4, 0x33, 0xc9,
-	0x3e, 0x4a, 0xe3, 0x50, 0x42, 0x9c, 0xc9, 0x05, 0xd5, 0x3d, 0xc8, 0xa7, 0x78, 0x78, 0xc2, 0x79,
-	0xca, 0xbf, 0x59, 0x64, 0xa0, 0x6f, 0x66, 0xe8, 0xbd, 0x5b, 0x16, 0xce, 0x5d, 0xa8, 0x83, 0x8d,
-	0x8a, 0x35, 0x92, 0x7c, 0x88, 0xbb, 0xda, 0xd1, 0x37, 0x37, 0xf4, 0xee, 0x96, 0x85, 0x73, 0x5b,
-	0x97, 0x34, 0xe0, 0x06, 0x41, 0xbe, 0x5c, 0xeb, 0xd5, 0xd5, 0x7a, 0x7d, 0xf0, 0x56, 0xbd, 0x8c,
-	0x06, 0x6f, 0x11, 0xec, 0x47, 0x84, 0x47, 0x9b, 0xd4, 0x88, 0x8b, 0x31, 0x05, 0x91, 0x47, 0x52,
-	0x4f, 0x6f, 0x04, 0x1b, 0x95, 0x85, 0x83, 0xf9, 0x2a, 0x4a, 0x1b, 0x08, 0x72, 0x8c, 0x7b, 0xc6,
-	0xb3, 0x76, 0xf4, 0x24, 0xef, 0x6d, 0x4b, 0x77, 0xca, 0xe2, 0x2c, 0x82, 0x53, 0xc9, 0x81, 0xc5,
-	0xde, 0xa8, 0x12, 0xae, 0x67, 0xba, 0xd1, 0xaa, 0x76, 0x72, 0x89, 0xf0, 0xad, 0x26, 0x90, 0xbc,
-	0xc4, 0xbd, 0x88, 0xcd, 0x20, 0x52, 0x77, 0xd6, 0xd6, 0x0f, 0x76, 0xf5, 0xf5, 0x3d, 0x83, 0x80,
-	0xcd, 0x17, 0xcf, 0x54, 0xf6, 0x39, 0x0b, 0xb9, 0x77, 0xa4, 0x7a, 0xfe, 0x51, 0x38, 0x1f, 0x37,
-	0xd7, 0x02, 0x67, 0x67, 0x2c, 0x61, 0xd3, 0x28, 0xbd, 0x08, 0xa7, 0xcd, 0x8f, 0xd8, 0xd5, 0x75,
-	0x87, 0x3e, 0xcb, 0x24, 0x70, 0x35, 0x48, 0x0c, 0x92, 0x87, 0x73, 0x5a, 0x9d, 0x46, 0xbe, 0xc0,
-	0x7d, 0xa1, 0xe7, 0x10, 0x15, 0x9f, 0xfb, 0xdb, 0x07, 0x9b, 0x31, 0xd7, 0x4c, 0x5e, 0xb2, 0x28,
-	0x07, 0x41, 0xeb, 0xb2, 0x49, 0x82, 0x47, 0xea, 0xcd, 0x83, 0xbf, 0x7a, 0x7f, 0x7b, 0xb8, 0x7d,
-	0x01, 0x8b, 0x4a, 0xcb, 0x7e, 0x59, 0x38, 0xca, 0xa5, 0xea, 0x87, 0x1c, 0xe2, 0x3e, 0x7c, 0x2f,
-	0x21, 0x91, 0xeb, 0xe3, 0xb6, 0xe4, 0x3b, 0xd1, 0x69, 0xef, 0x76, 0x75, 0x5c, 0x0d, 0xa7, 0xb5,
-	0x31, 0xf9, 0x15, 0xe1, 0x9e, 0x01, 0x11, 0xa7, 0x5e, 0x11, 0xea, 0xa8, 0xb6, 0x37, 0x2c, 0x0b,
-	0xc7, 0x04, 0xea, 0x6d, 0xb1, 0x67, 0xb6, 0x85, 0xde, 0x20, 0x66, 0x12, 0x48, 0x7c, 0xb3, 0x36,
-	0xc6, 0x78, 0x20, 0x39, 0x9b, 0xc3, 0x77, 0xa1, 0x5f, 0x3d, 0xc0, 0xfa, 0xb1, 0xe8, 0xf0, 0x13,
-	0x9f, 0x7c, 0x8e, 0x07, 0xbc, 0xa2, 0x54, 0x6d, 0x91, 0x7b, 0x6f, 0x6c, 0x91, 0xc3, 0x64, 0xe1,
-	0xdd, 0x2a, 0x0b, 0x67, 0x85, 0xa4, 0x2b, 0xeb, 0x69, 0x67, 0xd0, 0xbe, 0xd3, 0xf1, 0xc4, 0xd5,
-	0xb5, 0xdd, 0x7a, 0x75, 0x6d, 0xb7, 0x5e, 0x5f, 0xdb, 0xe8, 0x87, 0xa5, 0x8d, 0x7e, 0x59, 0xda,
-	0xe8, 0x72, 0x69, 0xa3, 0xab, 0xa5, 0x8d, 0xfe, 0x5a, 0xda, 0xe8, 0xef, 0xa5, 0xdd, 0x7a, 0xbd,
-	0xb4, 0xd1, 0x4f, 0x37, 0x76, 0xeb, 0xea, 0xc6, 0x6e, 0xbd, 0xba, 0xb1, 0x5b, 0xdf, 0x3e, 0xfe,
-	0xb7, 0xbb, 0xfd, 0xcf, 0x1d, 0x3c, 0xeb, 0xe9, 0x01, 0x3f, 0xf9, 0x27, 0x00, 0x00, 0xff, 0xff,
-	0x70, 0x6b, 0xd3, 0x23, 0x82, 0x06, 0x00, 0x00,
+	// 768 bytes of a gzipped FileDescriptorProto
+	0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0x94, 0x54, 0x4f, 0x6f, 0xd3, 0x4e,
+	0x10, 0x8d, 0x9b, 0xc4, 0x69, 0xb6, 0x3f, 0xe5, 0x27, 0xb6, 0x55, 0x31, 0xa5, 0xb2, 0xa3, 0x08,
+	0xa4, 0x20, 0x81, 0x8d, 0x5a, 0xe8, 0x01, 0x09, 0xa9, 0xb8, 0x7f, 0x84, 0xaa, 0x4a, 0x54, 0x6e,
+	0x25, 0x24, 0x6e, 0x9b, 0x64, 0xeb, 0x58, 0xb5, 0xbd, 0xee, 0xee, 0xba, 0x28, 0x37, 0x4e, 0x9c,
+	0x7b, 0x83, 0x8f, 0xc0, 0x47, 0xa9, 0xc4, 0xa5, 0xc7, 0x8a, 0x83, 0xa1, 0xee, 0x05, 0xe5, 0xd4,
+	0x8f, 0x80, 0x76, 0xed, 0xb4, 0x4e, 0x0a, 0x2a, 0x9c, 0x3c, 0xb3, 0xf3, 0xde, 0xdb, 0x99, 0x37,
+	0xd6, 0x82, 0x95, 0xe8, 0xc0, 0xb5, 0x0e, 0x63, 0x4c, 0x3d, 0x4c, 0xe5, 0x77, 0x40, 0x51, 0xe8,
+	0xe2, 0x42, 0xd8, 0x41, 0xac, 0x98, 0x9a, 0x11, 0x25, 0x9c, 0xc0, 0xc6, 0x38, 0x60, 0x61, 0xce,
+	0x25, 0x2e, 0x91, 0x25, 0x4b, 0x44, 0x19, 0x6a, 0x41, 0x77, 0x09, 0x71, 0x7d, 0x6c, 0xc9, 0xac,
+	0x13, 0xef, 0x5b, 0xbd, 0x98, 0x22, 0xee, 0x91, 0x30, 0xaf, 0x1b, 0x93, 0x75, 0xee, 0x05, 0x98,
+	0x71, 0x14, 0x44, 0x39, 0xe0, 0xbe, 0x68, 0xcf, 0x27, 0x6e, 0xa6, 0x3c, 0x0a, 0xf2, 0xe2, 0xda,
+	0xdf, 0xf5, 0xde, 0xc3, 0xfb, 0x5e, 0xe8, 0x89, 0x5b, 0x59, 0x31, 0xce, 0x45, 0x9e, 0x0a, 0x11,
+	0xc6, 0x09, 0x45, 0x2e, 0xb6, 0xba, 0xfd, 0x38, 0x3c, 0xb0, 0xba, 0xa8, 0xdb, 0xc7, 0x16, 0xc5,
+	0x2c, 0xf6, 0x39, 0xcb, 0x12, 0x3e, 0x88, 0x70, 0xce, 0x68, 0x7d, 0x2a, 0x83, 0x3b, 0x3b, 0x94,
+	0x04, 0x98, 0xf7, 0x71, 0xcc, 0x1c, 0x7c, 0x18, 0x63, 0xc6, 0x21, 0x04, 0x95, 0x08, 0xf1, 0xbe,
+	0xa6, 0x34, 0x95, 0x76, 0xdd, 0x91, 0x31, 0x7c, 0x01, 0xaa, 0x8c, 0x23, 0xca, 0xb5, 0xa9, 0xa6,
+	0xd2, 0x9e, 0x59, 0x5a, 0x30, 0xb3, 0x71, 0xcd, 0xd1, 0xb8, 0xe6, 0xde, 0x68, 0x5c, 0x7b, 0xfa,
+	0x24, 0x31, 0x4a, 0xc7, 0xdf, 0x0d, 0xc5, 0xc9, 0x28, 0x70, 0x05, 0x94, 0x71, 0xd8, 0xd3, 0xca,
+	0xff, 0xc0, 0x14, 0x04, 0xd1, 0x07, 0xe3, 0x38, 0xd2, 0x2a, 0x4d, 0xa5, 0x5d, 0x76, 0x64, 0x0c,
+	0x5f, 0x82, 0x9a, 0x30, 0x96, 0xc4, 0x5c, 0xab, 0x4a, 0xbd, 0x7b, 0x37, 0xf4, 0xd6, 0xf3, 0xc5,
+	0x64, 0x72, 0x9f, 0x85, 0xdc, 0x88, 0x03, 0xe7, 0x40, 0x55, 0x5a, 0xaa, 0xa9, 0x72, 0xb6, 0x2c,
+	0x81, 0x5b, 0xa0, 0x21, 0xbc, 0xf1, 0x42, 0xf7, 0x4d, 0x24, 0x0d, 0xd5, 0x6a, 0x52, 0x7b, 0xd1,
+	0x2c, 0x3a, 0x67, 0xae, 0x8d, 0x61, 0xec, 0x8a, 0x90, 0x77, 0x26, 0x98, 0x70, 0x03, 0xd4, 0x5e,
+	0x63, 0xd4, 0xc3, 0x94, 0x69, 0xd3, 0xcd, 0x72, 0x7b, 0x66, 0xe9, 0x81, 0x59, 0xdc, 0xd4, 0x0d,
+	0xb7, 0x33, 0xb0, 0x5d, 0x1d, 0x26, 0x86, 0xf2, 0xc4, 0x19, 0x71, 0x5b, 0xe9, 0x14, 0x80, 0x45,
+	0x2c, 0x8b, 0x48, 0xc8, 0x30, 0x6c, 0x01, 0x75, 0x97, 0x23, 0x1e, 0xb3, 0x6c, 0x39, 0x36, 0x18,
+	0x26, 0x86, 0xca, 0xe4, 0x89, 0x93, 0x57, 0xe0, 0x16, 0xa8, 0xac, 0x23, 0x8e, 0xf2, 0x4d, 0xe9,
+	0xe6, 0xf8, 0x3f, 0x54, 0xe8, 0x40, 0xa0, 0xec, 0x79, 0x31, 0xc5, 0x30, 0x31, 0x1a, 0x3d, 0xc4,
+	0xd1, 0x63, 0x12, 0x78, 0x1c, 0x07, 0x11, 0x1f, 0x38, 0x52, 0x03, 0x3e, 0x07, 0xf5, 0x0d, 0x4a,
+	0x09, 0xdd, 0x1b, 0x44, 0x58, 0x2e, 0xb0, 0x6e, 0xdf, 0x1d, 0x26, 0xc6, 0x2c, 0x1e, 0x1d, 0x16,
+	0x18, 0xd7, 0x48, 0xf8, 0x08, 0x54, 0x65, 0x22, 0x57, 0x57, 0xb7, 0x67, 0x87, 0x89, 0xf1, 0xbf,
+	0xa4, 0x14, 0xe0, 0x19, 0x02, 0x6e, 0x5e, 0xfb, 0x55, 0x95, 0x7e, 0x3d, 0xfc, 0xa3, 0x5f, 0x99,
+	0x07, 0xbf, 0x37, 0x0c, 0x2e, 0x81, 0xe9, 0xb7, 0x88, 0x86, 0x5e, 0xe8, 0x32, 0x4d, 0x6d, 0x96,
+	0xdb, 0x75, 0x7b, 0x7e, 0x98, 0x18, 0xf0, 0x7d, 0x7e, 0x56, 0xb8, 0xf8, 0x0a, 0xd7, 0xfa, 0xa8,
+	0x80, 0xc6, 0xb8, 0x1d, 0xd0, 0x04, 0xc0, 0x91, 0x3b, 0x97, 0x13, 0x67, 0x26, 0x37, 0x86, 0x89,
+	0x01, 0xe8, 0xd5, 0xa9, 0x53, 0x40, 0xc0, 0x75, 0xa0, 0x66, 0x99, 0x36, 0x25, 0xbb, 0x5f, 0x9c,
+	0xb4, 0x7b, 0x17, 0x05, 0x91, 0x8f, 0x77, 0x39, 0xc5, 0x28, 0xb0, 0x1b, 0xb9, 0xd9, 0x6a, 0xa6,
+	0xe6, 0xe4, 0xdc, 0xd6, 0x57, 0x05, 0xfc, 0x57, 0x04, 0xc2, 0x01, 0x50, 0x7d, 0xd4, 0xc1, 0xbe,
+	0xd8, 0x73, 0x59, 0xfe, 0xe5, 0x57, 0x0f, 0xc6, 0x36, 0x76, 0x51, 0x77, 0xb0, 0x2d, 0xaa, 0x3b,
+	0xc8, 0xa3, 0xf6, 0xa6, 0xd0, 0xfc, 0x96, 0x18, 0xcf, 0x5c, 0x8f, 0xf7, 0xe3, 0x8e, 0xd9, 0x25,
+	0x81, 0xe5, 0x52, 0xb4, 0x8f, 0x42, 0x64, 0xf9, 0xe4, 0xc0, 0xb3, 0x8e, 0x96, 0xad, 0xe2, 0xd3,
+	0x63, 0x4a, 0xea, 0xab, 0x1e, 0x8a, 0x38, 0xa6, 0xa2, 0x97, 0x00, 0x73, 0xea, 0x75, 0x9d, 0xfc,
+	0x42, 0xb8, 0x0a, 0x6a, 0x4c, 0xb6, 0xc2, 0xf2, 0x91, 0xe6, 0x27, 0xef, 0xce, 0x3a, 0xbd, 0x1e,
+	0xe6, 0x08, 0xf9, 0x31, 0x66, 0xce, 0x88, 0x66, 0x1f, 0x9d, 0x9e, 0xeb, 0xa5, 0xb3, 0x73, 0xbd,
+	0x74, 0x79, 0xae, 0x2b, 0x1f, 0x52, 0x5d, 0xf9, 0x92, 0xea, 0xca, 0x49, 0xaa, 0x2b, 0xa7, 0xa9,
+	0xae, 0xfc, 0x48, 0x75, 0xe5, 0x67, 0xaa, 0x97, 0x2e, 0x53, 0x5d, 0x39, 0xbe, 0xd0, 0x4b, 0xa7,
+	0x17, 0x7a, 0xe9, 0xec, 0x42, 0x2f, 0xbd, 0x5b, 0xbd, 0xa5, 0xff, 0x5b, 0x5f, 0xc7, 0x8e, 0x2a,
+	0x9b, 0x5c, 0xfe, 0x15, 0x00, 0x00, 0xff, 0xff, 0x8f, 0x2e, 0x5a, 0xee, 0x09, 0x06, 0x00, 0x00,
 }
 
 func (this *PrometheusRequest) Equal(that interface{}) bool {
@@ -512,10 +396,10 @@ func (this *PrometheusRequest) Equal(that interface{}) bool {
 	if this.Path != that1.Path {
 		return false
 	}
-	if this.Start != that1.Start {
+	if !this.Start.Equal(that1.Start) {
 		return false
 	}
-	if this.End != that1.End {
+	if !this.End.Equal(that1.End) {
 		return false
 	}
 	if this.Step != that1.Step {
@@ -576,6 +460,14 @@ func (this *PrometheusResponse) Equal(that interface{}) bool {
 	}
 	for i := range this.Headers {
 		if !this.Headers[i].Equal(that1.Headers[i]) {
+			return false
+		}
+	}
+	if len(this.Warnings) != len(that1.Warnings) {
+		return false
+	}
+	for i := range this.Warnings {
+		if this.Warnings[i] != that1.Warnings[i] {
 			return false
 		}
 	}
@@ -650,71 +542,6 @@ func (this *SampleStream) Equal(that interface{}) bool {
 	}
 	return true
 }
-func (this *CachedResponse) Equal(that interface{}) bool {
-	if that == nil {
-		return this == nil
-	}
-
-	that1, ok := that.(*CachedResponse)
-	if !ok {
-		that2, ok := that.(CachedResponse)
-		if ok {
-			that1 = &that2
-		} else {
-			return false
-		}
-	}
-	if that1 == nil {
-		return this == nil
-	} else if this == nil {
-		return false
-	}
-	if this.Key != that1.Key {
-		return false
-	}
-	if len(this.Extents) != len(that1.Extents) {
-		return false
-	}
-	for i := range this.Extents {
-		if !this.Extents[i].Equal(&that1.Extents[i]) {
-			return false
-		}
-	}
-	return true
-}
-func (this *Extent) Equal(that interface{}) bool {
-	if that == nil {
-		return this == nil
-	}
-
-	that1, ok := that.(*Extent)
-	if !ok {
-		that2, ok := that.(Extent)
-		if ok {
-			that1 = &that2
-		} else {
-			return false
-		}
-	}
-	if that1 == nil {
-		return this == nil
-	} else if this == nil {
-		return false
-	}
-	if this.Start != that1.Start {
-		return false
-	}
-	if this.End != that1.End {
-		return false
-	}
-	if this.TraceId != that1.TraceId {
-		return false
-	}
-	if !this.Response.Equal(that1.Response) {
-		return false
-	}
-	return true
-}
 func (this *PrometheusRequest) GoString() string {
 	if this == nil {
 		return "nil"
@@ -738,7 +565,7 @@ func (this *PrometheusResponse) GoString() string {
 	if this == nil {
 		return "nil"
 	}
-	s := make([]string, 0, 9)
+	s := make([]string, 0, 10)
 	s = append(s, "&queryrangebase.PrometheusResponse{")
 	s = append(s, "Status: "+fmt.Sprintf("%#v", this.Status)+",\n")
 	s = append(s, "Data: "+strings.Replace(this.Data.GoString(), `&`, ``, 1)+",\n")
@@ -747,6 +574,7 @@ func (this *PrometheusResponse) GoString() string {
 	if this.Headers != nil {
 		s = append(s, "Headers: "+fmt.Sprintf("%#v", this.Headers)+",\n")
 	}
+	s = append(s, "Warnings: "+fmt.Sprintf("%#v", this.Warnings)+",\n")
 	s = append(s, "}")
 	return strings.Join(s, "")
 }
@@ -780,38 +608,6 @@ func (this *SampleStream) GoString() string {
 			vs[i] = &this.Samples[i]
 		}
 		s = append(s, "Samples: "+fmt.Sprintf("%#v", vs)+",\n")
-	}
-	s = append(s, "}")
-	return strings.Join(s, "")
-}
-func (this *CachedResponse) GoString() string {
-	if this == nil {
-		return "nil"
-	}
-	s := make([]string, 0, 6)
-	s = append(s, "&queryrangebase.CachedResponse{")
-	s = append(s, "Key: "+fmt.Sprintf("%#v", this.Key)+",\n")
-	if this.Extents != nil {
-		vs := make([]*Extent, len(this.Extents))
-		for i := range vs {
-			vs[i] = &this.Extents[i]
-		}
-		s = append(s, "Extents: "+fmt.Sprintf("%#v", vs)+",\n")
-	}
-	s = append(s, "}")
-	return strings.Join(s, "")
-}
-func (this *Extent) GoString() string {
-	if this == nil {
-		return "nil"
-	}
-	s := make([]string, 0, 8)
-	s = append(s, "&queryrangebase.Extent{")
-	s = append(s, "Start: "+fmt.Sprintf("%#v", this.Start)+",\n")
-	s = append(s, "End: "+fmt.Sprintf("%#v", this.End)+",\n")
-	s = append(s, "TraceId: "+fmt.Sprintf("%#v", this.TraceId)+",\n")
-	if this.Response != nil {
-		s = append(s, "Response: "+fmt.Sprintf("%#v", this.Response)+",\n")
 	}
 	s = append(s, "}")
 	return strings.Join(s, "")
@@ -888,16 +684,22 @@ func (m *PrometheusRequest) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 		i--
 		dAtA[i] = 0x20
 	}
-	if m.End != 0 {
-		i = encodeVarintQueryrange(dAtA, i, uint64(m.End))
-		i--
-		dAtA[i] = 0x18
+	n3, err3 := github_com_gogo_protobuf_types.StdTimeMarshalTo(m.End, dAtA[i-github_com_gogo_protobuf_types.SizeOfStdTime(m.End):])
+	if err3 != nil {
+		return 0, err3
 	}
-	if m.Start != 0 {
-		i = encodeVarintQueryrange(dAtA, i, uint64(m.Start))
-		i--
-		dAtA[i] = 0x10
+	i -= n3
+	i = encodeVarintQueryrange(dAtA, i, uint64(n3))
+	i--
+	dAtA[i] = 0x1a
+	n4, err4 := github_com_gogo_protobuf_types.StdTimeMarshalTo(m.Start, dAtA[i-github_com_gogo_protobuf_types.SizeOfStdTime(m.Start):])
+	if err4 != nil {
+		return 0, err4
 	}
+	i -= n4
+	i = encodeVarintQueryrange(dAtA, i, uint64(n4))
+	i--
+	dAtA[i] = 0x12
 	if len(m.Path) > 0 {
 		i -= len(m.Path)
 		copy(dAtA[i:], m.Path)
@@ -928,6 +730,15 @@ func (m *PrometheusResponse) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 	_ = i
 	var l int
 	_ = l
+	if len(m.Warnings) > 0 {
+		for iNdEx := len(m.Warnings) - 1; iNdEx >= 0; iNdEx-- {
+			i -= len(m.Warnings[iNdEx])
+			copy(dAtA[i:], m.Warnings[iNdEx])
+			i = encodeVarintQueryrange(dAtA, i, uint64(len(m.Warnings[iNdEx])))
+			i--
+			dAtA[i] = 0x32
+		}
+	}
 	if len(m.Headers) > 0 {
 		for iNdEx := len(m.Headers) - 1; iNdEx >= 0; iNdEx-- {
 			{
@@ -1071,102 +882,6 @@ func (m *SampleStream) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 	return len(dAtA) - i, nil
 }
 
-func (m *CachedResponse) Marshal() (dAtA []byte, err error) {
-	size := m.Size()
-	dAtA = make([]byte, size)
-	n, err := m.MarshalToSizedBuffer(dAtA[:size])
-	if err != nil {
-		return nil, err
-	}
-	return dAtA[:n], nil
-}
-
-func (m *CachedResponse) MarshalTo(dAtA []byte) (int, error) {
-	size := m.Size()
-	return m.MarshalToSizedBuffer(dAtA[:size])
-}
-
-func (m *CachedResponse) MarshalToSizedBuffer(dAtA []byte) (int, error) {
-	i := len(dAtA)
-	_ = i
-	var l int
-	_ = l
-	if len(m.Extents) > 0 {
-		for iNdEx := len(m.Extents) - 1; iNdEx >= 0; iNdEx-- {
-			{
-				size, err := m.Extents[iNdEx].MarshalToSizedBuffer(dAtA[:i])
-				if err != nil {
-					return 0, err
-				}
-				i -= size
-				i = encodeVarintQueryrange(dAtA, i, uint64(size))
-			}
-			i--
-			dAtA[i] = 0x12
-		}
-	}
-	if len(m.Key) > 0 {
-		i -= len(m.Key)
-		copy(dAtA[i:], m.Key)
-		i = encodeVarintQueryrange(dAtA, i, uint64(len(m.Key)))
-		i--
-		dAtA[i] = 0xa
-	}
-	return len(dAtA) - i, nil
-}
-
-func (m *Extent) Marshal() (dAtA []byte, err error) {
-	size := m.Size()
-	dAtA = make([]byte, size)
-	n, err := m.MarshalToSizedBuffer(dAtA[:size])
-	if err != nil {
-		return nil, err
-	}
-	return dAtA[:n], nil
-}
-
-func (m *Extent) MarshalTo(dAtA []byte) (int, error) {
-	size := m.Size()
-	return m.MarshalToSizedBuffer(dAtA[:size])
-}
-
-func (m *Extent) MarshalToSizedBuffer(dAtA []byte) (int, error) {
-	i := len(dAtA)
-	_ = i
-	var l int
-	_ = l
-	if m.Response != nil {
-		{
-			size, err := m.Response.MarshalToSizedBuffer(dAtA[:i])
-			if err != nil {
-				return 0, err
-			}
-			i -= size
-			i = encodeVarintQueryrange(dAtA, i, uint64(size))
-		}
-		i--
-		dAtA[i] = 0x2a
-	}
-	if len(m.TraceId) > 0 {
-		i -= len(m.TraceId)
-		copy(dAtA[i:], m.TraceId)
-		i = encodeVarintQueryrange(dAtA, i, uint64(len(m.TraceId)))
-		i--
-		dAtA[i] = 0x22
-	}
-	if m.End != 0 {
-		i = encodeVarintQueryrange(dAtA, i, uint64(m.End))
-		i--
-		dAtA[i] = 0x10
-	}
-	if m.Start != 0 {
-		i = encodeVarintQueryrange(dAtA, i, uint64(m.Start))
-		i--
-		dAtA[i] = 0x8
-	}
-	return len(dAtA) - i, nil
-}
-
 func encodeVarintQueryrange(dAtA []byte, offset int, v uint64) int {
 	offset -= sovQueryrange(v)
 	base := offset
@@ -1188,12 +903,10 @@ func (m *PrometheusRequest) Size() (n int) {
 	if l > 0 {
 		n += 1 + l + sovQueryrange(uint64(l))
 	}
-	if m.Start != 0 {
-		n += 1 + sovQueryrange(uint64(m.Start))
-	}
-	if m.End != 0 {
-		n += 1 + sovQueryrange(uint64(m.End))
-	}
+	l = github_com_gogo_protobuf_types.SizeOfStdTime(m.Start)
+	n += 1 + l + sovQueryrange(uint64(l))
+	l = github_com_gogo_protobuf_types.SizeOfStdTime(m.End)
+	n += 1 + l + sovQueryrange(uint64(l))
 	if m.Step != 0 {
 		n += 1 + sovQueryrange(uint64(m.Step))
 	}
@@ -1240,6 +953,12 @@ func (m *PrometheusResponse) Size() (n int) {
 			n += 1 + l + sovQueryrange(uint64(l))
 		}
 	}
+	if len(m.Warnings) > 0 {
+		for _, s := range m.Warnings {
+			l = len(s)
+			n += 1 + l + sovQueryrange(uint64(l))
+		}
+	}
 	return n
 }
 
@@ -1283,48 +1002,6 @@ func (m *SampleStream) Size() (n int) {
 	return n
 }
 
-func (m *CachedResponse) Size() (n int) {
-	if m == nil {
-		return 0
-	}
-	var l int
-	_ = l
-	l = len(m.Key)
-	if l > 0 {
-		n += 1 + l + sovQueryrange(uint64(l))
-	}
-	if len(m.Extents) > 0 {
-		for _, e := range m.Extents {
-			l = e.Size()
-			n += 1 + l + sovQueryrange(uint64(l))
-		}
-	}
-	return n
-}
-
-func (m *Extent) Size() (n int) {
-	if m == nil {
-		return 0
-	}
-	var l int
-	_ = l
-	if m.Start != 0 {
-		n += 1 + sovQueryrange(uint64(m.Start))
-	}
-	if m.End != 0 {
-		n += 1 + sovQueryrange(uint64(m.End))
-	}
-	l = len(m.TraceId)
-	if l > 0 {
-		n += 1 + l + sovQueryrange(uint64(l))
-	}
-	if m.Response != nil {
-		l = m.Response.Size()
-		n += 1 + l + sovQueryrange(uint64(l))
-	}
-	return n
-}
-
 func sovQueryrange(x uint64) (n int) {
 	return (math_bits.Len64(x|1) + 6) / 7
 }
@@ -1342,12 +1019,12 @@ func (this *PrometheusRequest) String() string {
 	repeatedStringForHeaders += "}"
 	s := strings.Join([]string{`&PrometheusRequest{`,
 		`Path:` + fmt.Sprintf("%v", this.Path) + `,`,
-		`Start:` + fmt.Sprintf("%v", this.Start) + `,`,
-		`End:` + fmt.Sprintf("%v", this.End) + `,`,
+		`Start:` + strings.Replace(strings.Replace(fmt.Sprintf("%v", this.Start), "Timestamp", "types.Timestamp", 1), `&`, ``, 1) + `,`,
+		`End:` + strings.Replace(strings.Replace(fmt.Sprintf("%v", this.End), "Timestamp", "types.Timestamp", 1), `&`, ``, 1) + `,`,
 		`Step:` + fmt.Sprintf("%v", this.Step) + `,`,
 		`Timeout:` + strings.Replace(strings.Replace(fmt.Sprintf("%v", this.Timeout), "Duration", "duration.Duration", 1), `&`, ``, 1) + `,`,
 		`Query:` + fmt.Sprintf("%v", this.Query) + `,`,
-		`CachingOptions:` + strings.Replace(strings.Replace(fmt.Sprintf("%v", this.CachingOptions), "CachingOptions", "definitions.CachingOptions", 1), `&`, ``, 1) + `,`,
+		`CachingOptions:` + strings.Replace(strings.Replace(fmt.Sprintf("%v", this.CachingOptions), "CachingOptions", "resultscache.CachingOptions", 1), `&`, ``, 1) + `,`,
 		`Headers:` + repeatedStringForHeaders + `,`,
 		`}`,
 	}, "")
@@ -1368,6 +1045,7 @@ func (this *PrometheusResponse) String() string {
 		`ErrorType:` + fmt.Sprintf("%v", this.ErrorType) + `,`,
 		`Error:` + fmt.Sprintf("%v", this.Error) + `,`,
 		`Headers:` + repeatedStringForHeaders + `,`,
+		`Warnings:` + fmt.Sprintf("%v", this.Warnings) + `,`,
 		`}`,
 	}, "")
 	return s
@@ -1400,35 +1078,6 @@ func (this *SampleStream) String() string {
 	s := strings.Join([]string{`&SampleStream{`,
 		`Labels:` + fmt.Sprintf("%v", this.Labels) + `,`,
 		`Samples:` + repeatedStringForSamples + `,`,
-		`}`,
-	}, "")
-	return s
-}
-func (this *CachedResponse) String() string {
-	if this == nil {
-		return "nil"
-	}
-	repeatedStringForExtents := "[]Extent{"
-	for _, f := range this.Extents {
-		repeatedStringForExtents += strings.Replace(strings.Replace(f.String(), "Extent", "Extent", 1), `&`, ``, 1) + ","
-	}
-	repeatedStringForExtents += "}"
-	s := strings.Join([]string{`&CachedResponse{`,
-		`Key:` + fmt.Sprintf("%v", this.Key) + `,`,
-		`Extents:` + repeatedStringForExtents + `,`,
-		`}`,
-	}, "")
-	return s
-}
-func (this *Extent) String() string {
-	if this == nil {
-		return "nil"
-	}
-	s := strings.Join([]string{`&Extent{`,
-		`Start:` + fmt.Sprintf("%v", this.Start) + `,`,
-		`End:` + fmt.Sprintf("%v", this.End) + `,`,
-		`TraceId:` + fmt.Sprintf("%v", this.TraceId) + `,`,
-		`Response:` + strings.Replace(fmt.Sprintf("%v", this.Response), "Any", "types.Any", 1) + `,`,
 		`}`,
 	}, "")
 	return s
@@ -1503,10 +1152,10 @@ func (m *PrometheusRequest) Unmarshal(dAtA []byte) error {
 			m.Path = string(dAtA[iNdEx:postIndex])
 			iNdEx = postIndex
 		case 2:
-			if wireType != 0 {
+			if wireType != 2 {
 				return fmt.Errorf("proto: wrong wireType = %d for field Start", wireType)
 			}
-			m.Start = 0
+			var msglen int
 			for shift := uint(0); ; shift += 7 {
 				if shift >= 64 {
 					return ErrIntOverflowQueryrange
@@ -1516,16 +1165,30 @@ func (m *PrometheusRequest) Unmarshal(dAtA []byte) error {
 				}
 				b := dAtA[iNdEx]
 				iNdEx++
-				m.Start |= int64(b&0x7F) << shift
+				msglen |= int(b&0x7F) << shift
 				if b < 0x80 {
 					break
 				}
 			}
+			if msglen < 0 {
+				return ErrInvalidLengthQueryrange
+			}
+			postIndex := iNdEx + msglen
+			if postIndex < 0 {
+				return ErrInvalidLengthQueryrange
+			}
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if err := github_com_gogo_protobuf_types.StdTimeUnmarshal(&m.Start, dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
 		case 3:
-			if wireType != 0 {
+			if wireType != 2 {
 				return fmt.Errorf("proto: wrong wireType = %d for field End", wireType)
 			}
-			m.End = 0
+			var msglen int
 			for shift := uint(0); ; shift += 7 {
 				if shift >= 64 {
 					return ErrIntOverflowQueryrange
@@ -1535,11 +1198,25 @@ func (m *PrometheusRequest) Unmarshal(dAtA []byte) error {
 				}
 				b := dAtA[iNdEx]
 				iNdEx++
-				m.End |= int64(b&0x7F) << shift
+				msglen |= int(b&0x7F) << shift
 				if b < 0x80 {
 					break
 				}
 			}
+			if msglen < 0 {
+				return ErrInvalidLengthQueryrange
+			}
+			postIndex := iNdEx + msglen
+			if postIndex < 0 {
+				return ErrInvalidLengthQueryrange
+			}
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if err := github_com_gogo_protobuf_types.StdTimeUnmarshal(&m.End, dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
 		case 4:
 			if wireType != 0 {
 				return fmt.Errorf("proto: wrong wireType = %d for field Step", wireType)
@@ -1907,6 +1584,38 @@ func (m *PrometheusResponse) Unmarshal(dAtA []byte) error {
 				return err
 			}
 			iNdEx = postIndex
+		case 6:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Warnings", wireType)
+			}
+			var stringLen uint64
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowQueryrange
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				stringLen |= uint64(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			intStringLen := int(stringLen)
+			if intStringLen < 0 {
+				return ErrInvalidLengthQueryrange
+			}
+			postIndex := iNdEx + intStringLen
+			if postIndex < 0 {
+				return ErrInvalidLengthQueryrange
+			}
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.Warnings = append(m.Warnings, string(dAtA[iNdEx:postIndex]))
+			iNdEx = postIndex
 		default:
 			iNdEx = preIndex
 			skippy, err := skipQueryrange(dAtA[iNdEx:])
@@ -2108,7 +1817,7 @@ func (m *SampleStream) Unmarshal(dAtA []byte) error {
 			if postIndex > l {
 				return io.ErrUnexpectedEOF
 			}
-			m.Labels = append(m.Labels, github_com_grafana_loki_pkg_logproto.LabelAdapter{})
+			m.Labels = append(m.Labels, github_com_grafana_loki_v3_pkg_logproto.LabelAdapter{})
 			if err := m.Labels[len(m.Labels)-1].Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
 				return err
 			}
@@ -2144,284 +1853,6 @@ func (m *SampleStream) Unmarshal(dAtA []byte) error {
 			}
 			m.Samples = append(m.Samples, logproto.LegacySample{})
 			if err := m.Samples[len(m.Samples)-1].Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
-				return err
-			}
-			iNdEx = postIndex
-		default:
-			iNdEx = preIndex
-			skippy, err := skipQueryrange(dAtA[iNdEx:])
-			if err != nil {
-				return err
-			}
-			if skippy < 0 {
-				return ErrInvalidLengthQueryrange
-			}
-			if (iNdEx + skippy) < 0 {
-				return ErrInvalidLengthQueryrange
-			}
-			if (iNdEx + skippy) > l {
-				return io.ErrUnexpectedEOF
-			}
-			iNdEx += skippy
-		}
-	}
-
-	if iNdEx > l {
-		return io.ErrUnexpectedEOF
-	}
-	return nil
-}
-func (m *CachedResponse) Unmarshal(dAtA []byte) error {
-	l := len(dAtA)
-	iNdEx := 0
-	for iNdEx < l {
-		preIndex := iNdEx
-		var wire uint64
-		for shift := uint(0); ; shift += 7 {
-			if shift >= 64 {
-				return ErrIntOverflowQueryrange
-			}
-			if iNdEx >= l {
-				return io.ErrUnexpectedEOF
-			}
-			b := dAtA[iNdEx]
-			iNdEx++
-			wire |= uint64(b&0x7F) << shift
-			if b < 0x80 {
-				break
-			}
-		}
-		fieldNum := int32(wire >> 3)
-		wireType := int(wire & 0x7)
-		if wireType == 4 {
-			return fmt.Errorf("proto: CachedResponse: wiretype end group for non-group")
-		}
-		if fieldNum <= 0 {
-			return fmt.Errorf("proto: CachedResponse: illegal tag %d (wire type %d)", fieldNum, wire)
-		}
-		switch fieldNum {
-		case 1:
-			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field Key", wireType)
-			}
-			var stringLen uint64
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowQueryrange
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := dAtA[iNdEx]
-				iNdEx++
-				stringLen |= uint64(b&0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
-			intStringLen := int(stringLen)
-			if intStringLen < 0 {
-				return ErrInvalidLengthQueryrange
-			}
-			postIndex := iNdEx + intStringLen
-			if postIndex < 0 {
-				return ErrInvalidLengthQueryrange
-			}
-			if postIndex > l {
-				return io.ErrUnexpectedEOF
-			}
-			m.Key = string(dAtA[iNdEx:postIndex])
-			iNdEx = postIndex
-		case 2:
-			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field Extents", wireType)
-			}
-			var msglen int
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowQueryrange
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := dAtA[iNdEx]
-				iNdEx++
-				msglen |= int(b&0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
-			if msglen < 0 {
-				return ErrInvalidLengthQueryrange
-			}
-			postIndex := iNdEx + msglen
-			if postIndex < 0 {
-				return ErrInvalidLengthQueryrange
-			}
-			if postIndex > l {
-				return io.ErrUnexpectedEOF
-			}
-			m.Extents = append(m.Extents, Extent{})
-			if err := m.Extents[len(m.Extents)-1].Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
-				return err
-			}
-			iNdEx = postIndex
-		default:
-			iNdEx = preIndex
-			skippy, err := skipQueryrange(dAtA[iNdEx:])
-			if err != nil {
-				return err
-			}
-			if skippy < 0 {
-				return ErrInvalidLengthQueryrange
-			}
-			if (iNdEx + skippy) < 0 {
-				return ErrInvalidLengthQueryrange
-			}
-			if (iNdEx + skippy) > l {
-				return io.ErrUnexpectedEOF
-			}
-			iNdEx += skippy
-		}
-	}
-
-	if iNdEx > l {
-		return io.ErrUnexpectedEOF
-	}
-	return nil
-}
-func (m *Extent) Unmarshal(dAtA []byte) error {
-	l := len(dAtA)
-	iNdEx := 0
-	for iNdEx < l {
-		preIndex := iNdEx
-		var wire uint64
-		for shift := uint(0); ; shift += 7 {
-			if shift >= 64 {
-				return ErrIntOverflowQueryrange
-			}
-			if iNdEx >= l {
-				return io.ErrUnexpectedEOF
-			}
-			b := dAtA[iNdEx]
-			iNdEx++
-			wire |= uint64(b&0x7F) << shift
-			if b < 0x80 {
-				break
-			}
-		}
-		fieldNum := int32(wire >> 3)
-		wireType := int(wire & 0x7)
-		if wireType == 4 {
-			return fmt.Errorf("proto: Extent: wiretype end group for non-group")
-		}
-		if fieldNum <= 0 {
-			return fmt.Errorf("proto: Extent: illegal tag %d (wire type %d)", fieldNum, wire)
-		}
-		switch fieldNum {
-		case 1:
-			if wireType != 0 {
-				return fmt.Errorf("proto: wrong wireType = %d for field Start", wireType)
-			}
-			m.Start = 0
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowQueryrange
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := dAtA[iNdEx]
-				iNdEx++
-				m.Start |= int64(b&0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
-		case 2:
-			if wireType != 0 {
-				return fmt.Errorf("proto: wrong wireType = %d for field End", wireType)
-			}
-			m.End = 0
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowQueryrange
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := dAtA[iNdEx]
-				iNdEx++
-				m.End |= int64(b&0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
-		case 4:
-			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field TraceId", wireType)
-			}
-			var stringLen uint64
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowQueryrange
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := dAtA[iNdEx]
-				iNdEx++
-				stringLen |= uint64(b&0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
-			intStringLen := int(stringLen)
-			if intStringLen < 0 {
-				return ErrInvalidLengthQueryrange
-			}
-			postIndex := iNdEx + intStringLen
-			if postIndex < 0 {
-				return ErrInvalidLengthQueryrange
-			}
-			if postIndex > l {
-				return io.ErrUnexpectedEOF
-			}
-			m.TraceId = string(dAtA[iNdEx:postIndex])
-			iNdEx = postIndex
-		case 5:
-			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field Response", wireType)
-			}
-			var msglen int
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowQueryrange
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := dAtA[iNdEx]
-				iNdEx++
-				msglen |= int(b&0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
-			if msglen < 0 {
-				return ErrInvalidLengthQueryrange
-			}
-			postIndex := iNdEx + msglen
-			if postIndex < 0 {
-				return ErrInvalidLengthQueryrange
-			}
-			if postIndex > l {
-				return io.ErrUnexpectedEOF
-			}
-			if m.Response == nil {
-				m.Response = &types.Any{}
-			}
-			if err := m.Response.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
 				return err
 			}
 			iNdEx = postIndex

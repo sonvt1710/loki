@@ -7,38 +7,38 @@ import (
 
 	"github.com/go-kit/log"
 	"github.com/pkg/errors"
-	"github.com/prometheus/client_golang/prometheus"
 	promRules "github.com/prometheus/prometheus/rules"
 
-	configClient "github.com/grafana/loki/pkg/configs/client"
-	"github.com/grafana/loki/pkg/ruler/rulestore"
-	"github.com/grafana/loki/pkg/ruler/rulestore/bucketclient"
-	"github.com/grafana/loki/pkg/ruler/rulestore/configdb"
-	"github.com/grafana/loki/pkg/ruler/rulestore/local"
-	"github.com/grafana/loki/pkg/ruler/rulestore/objectclient"
-	"github.com/grafana/loki/pkg/storage"
-	"github.com/grafana/loki/pkg/storage/bucket"
-	"github.com/grafana/loki/pkg/storage/chunk/client"
-	"github.com/grafana/loki/pkg/storage/chunk/client/aws"
-	"github.com/grafana/loki/pkg/storage/chunk/client/azure"
-	"github.com/grafana/loki/pkg/storage/chunk/client/baidubce"
-	"github.com/grafana/loki/pkg/storage/chunk/client/gcp"
-	"github.com/grafana/loki/pkg/storage/chunk/client/hedging"
-	"github.com/grafana/loki/pkg/storage/chunk/client/openstack"
+	"github.com/grafana/loki/v3/pkg/ruler/rulestore"
+	"github.com/grafana/loki/v3/pkg/ruler/rulestore/bucketclient"
+	"github.com/grafana/loki/v3/pkg/ruler/rulestore/local"
+	"github.com/grafana/loki/v3/pkg/ruler/rulestore/objectclient"
+	"github.com/grafana/loki/v3/pkg/storage"
+	"github.com/grafana/loki/v3/pkg/storage/bucket"
+	"github.com/grafana/loki/v3/pkg/storage/chunk/client"
+	"github.com/grafana/loki/v3/pkg/storage/chunk/client/alibaba"
+	"github.com/grafana/loki/v3/pkg/storage/chunk/client/aws"
+	"github.com/grafana/loki/v3/pkg/storage/chunk/client/azure"
+	"github.com/grafana/loki/v3/pkg/storage/chunk/client/baidubce"
+	"github.com/grafana/loki/v3/pkg/storage/chunk/client/gcp"
+	"github.com/grafana/loki/v3/pkg/storage/chunk/client/hedging"
+	"github.com/grafana/loki/v3/pkg/storage/chunk/client/ibmcloud"
+	"github.com/grafana/loki/v3/pkg/storage/chunk/client/openstack"
 )
 
 // RuleStoreConfig configures a rule store.
-// TODO remove this legacy config in Cortex 1.11.
 type RuleStoreConfig struct {
 	Type string `yaml:"type"`
 
 	// Object Storage Configs
-	Azure azure.BlobStorageConfig   `yaml:"azure"`
-	GCS   gcp.GCSConfig             `yaml:"gcs"`
-	S3    aws.S3Config              `yaml:"s3"`
-	BOS   baidubce.BOSStorageConfig `yaml:"bos"`
-	Swift openstack.SwiftConfig     `yaml:"swift"`
-	Local local.Config              `yaml:"local"`
+	Azure        azure.BlobStorageConfig   `yaml:"azure" doc:"description=Configures backend rule storage for Azure."`
+	AlibabaCloud alibaba.OssConfig         `yaml:"alibabacloud" doc:"description=Configures backend rule storage for AlibabaCloud Object Storage (OSS)."`
+	GCS          gcp.GCSConfig             `yaml:"gcs" doc:"description=Configures backend rule storage for GCS."`
+	S3           aws.S3Config              `yaml:"s3" doc:"description=Configures backend rule storage for S3."`
+	BOS          baidubce.BOSStorageConfig `yaml:"bos" doc:"description=Configures backend rule storage for Baidu Object Storage (BOS)."`
+	Swift        openstack.SwiftConfig     `yaml:"swift" doc:"description=Configures backend rule storage for Swift."`
+	COS          ibmcloud.COSConfig        `yaml:"cos" doc:"description=Configures backend rule storage for IBM Cloud Object Storage (COS)."`
+	Local        local.Config              `yaml:"local" doc:"description=Configures backend rule storage for a local file system directory."`
 
 	mock rulestore.RuleStore `yaml:"-"`
 }
@@ -46,12 +46,14 @@ type RuleStoreConfig struct {
 // RegisterFlags registers flags.
 func (cfg *RuleStoreConfig) RegisterFlags(f *flag.FlagSet) {
 	cfg.Azure.RegisterFlagsWithPrefix("ruler.storage.", f)
+	cfg.AlibabaCloud.RegisterFlagsWithPrefix("ruler.storage.", f)
 	cfg.GCS.RegisterFlagsWithPrefix("ruler.storage.", f)
 	cfg.S3.RegisterFlagsWithPrefix("ruler.storage.", f)
 	cfg.Swift.RegisterFlagsWithPrefix("ruler.storage.", f)
 	cfg.Local.RegisterFlagsWithPrefix("ruler.storage.", f)
 	cfg.BOS.RegisterFlagsWithPrefix("ruler.storage.", f)
-	f.StringVar(&cfg.Type, "ruler.storage.type", "", "Method to use for backend rule storage (configdb, azure, gcs, s3, swift, local)")
+	cfg.COS.RegisterFlagsWithPrefix("ruler.storage.", f)
+	f.StringVar(&cfg.Type, "ruler.storage.type", "", "Method to use for backend rule storage (configdb, azure, gcs, s3, swift, local, bos, cos)")
 }
 
 // Validate config and returns error on failure
@@ -99,6 +101,10 @@ func NewLegacyRuleStore(cfg RuleStoreConfig, hedgeCfg hedging.Config, clientMetr
 		client, err = baidubce.NewBOSObjectStorage(&cfg.BOS)
 	case "swift":
 		client, err = openstack.NewSwiftObjectClient(cfg.Swift, hedgeCfg)
+	case "cos":
+		client, err = ibmcloud.NewCOSObjectClient(cfg.COS, hedgeCfg)
+	case "alibabacloud":
+		client, err = alibaba.NewOssObjectClient(context.Background(), cfg.AlibabaCloud)
 	case "local":
 		return local.NewLocalRulesClient(cfg.Local, loader)
 	default:
@@ -113,29 +119,18 @@ func NewLegacyRuleStore(cfg RuleStoreConfig, hedgeCfg hedging.Config, clientMetr
 }
 
 // NewRuleStore returns a rule store backend client based on the provided cfg.
-func NewRuleStore(ctx context.Context, cfg rulestore.Config, cfgProvider bucket.TenantConfigProvider, loader promRules.GroupLoader, logger log.Logger, reg prometheus.Registerer) (rulestore.RuleStore, error) {
-	if cfg.Backend == configdb.Name {
-		c, err := configClient.New(cfg.ConfigDB)
-		if err != nil {
-			return nil, err
-		}
-
-		return configdb.NewConfigRuleStore(c), nil
-	}
-
+func NewRuleStore(ctx context.Context, cfg rulestore.Config, cfgProvider bucket.SSEConfigProvider, loader promRules.GroupLoader, logger log.Logger) (rulestore.RuleStore, error) {
 	if cfg.Backend == local.Name {
+		if loader == nil {
+			loader = promRules.FileLoader{}
+		}
 		return local.NewLocalRulesClient(cfg.Local, loader)
 	}
 
-	bucketClient, err := bucket.NewClient(ctx, cfg.Config, "ruler-storage", logger, reg)
+	bucketClient, err := bucket.NewClient(ctx, cfg.Backend, cfg.Config, "ruler-storage", logger)
 	if err != nil {
 		return nil, err
 	}
 
-	store := bucketclient.NewBucketRuleStore(bucketClient, cfgProvider, logger)
-	if err != nil {
-		return nil, err
-	}
-
-	return store, nil
+	return bucketclient.NewBucketRuleStore(bucketClient, cfgProvider, logger), nil
 }

@@ -11,26 +11,54 @@ local utils = import 'mixin-utils/utils.libsonnet';
                                showAnnotations:: true,
                                showLinks:: true,
                                showMultiCluster:: true,
-                               clusterLabel:: $._config.per_cluster_label,
 
                                hiddenRows:: [
                                  'Cassandra',
-                               ] + if !$._config.ssd.enabled then [] else [
-                                 'Ingester',
+                                 if $._config.ssd.enabled then 'Ingester',
+                                 if !$._config.ssd.enabled then 'Backend Path',
+                                 if !$._config.operational.memcached then 'Memcached',
+                                 if !$._config.operational.consul then 'Consul',
+                                 if !$._config.operational.bigTable then 'Big Table',
+                                 if !$._config.operational.dynamo then 'Dynamo',
+                                 if !$._config.operational.gcs then 'GCS',
+                                 if !$._config.operational.s3 then 'S3',
+                                 if !$._config.operational.azureBlob then 'Azure Blob',
+                                 if !$._config.operational.boltDB then 'BoltDB Shipper',
+                               ],
+
+                               hiddenPanels:: if $._config.promtail.enabled then [] else [
+                                 'Bad Words',
                                ],
 
                                jobMatchers:: {
                                  cortexgateway: [utils.selector.re('job', '($namespace)/cortex-gw(-internal)?')],
-                                 distributor: [utils.selector.re('job', '($namespace)/%s' % (if $._config.ssd.enabled then '%s-write' % $._config.ssd.pod_prefix_matcher else 'distributor'))],
-                                 ingester: [utils.selector.re('job', '($namespace)/%s' % (if $._config.ssd.enabled then '%s-write' % $._config.ssd.pod_prefix_matcher else 'ingester.*'))],
-                                 querier: [utils.selector.re('job', '($namespace)/%s' % (if $._config.ssd.enabled then '%s-read' % $._config.ssd.pod_prefix_matcher else 'querier'))],
+                                 distributor: if $._config.meta_monitoring.enabled
+                                 then [utils.selector.re('job', '($namespace)/(distributor|%s-write|loki-single-binary)' % $._config.ssd.pod_prefix_matcher)]
+                                 else [utils.selector.re('job', '($namespace)/%s' % (if $._config.ssd.enabled then '%s-write' % $._config.ssd.pod_prefix_matcher else 'distributor'))],
+                                 ingester: if $._config.meta_monitoring.enabled
+                                 then [utils.selector.re('job', '($namespace)/(partition-ingester.*|ingester.*|%s-write|loki-single-binary)' % $._config.ssd.pod_prefix_matcher)]
+                                 else [utils.selector.re('job', '($namespace)/%s' % (if $._config.ssd.enabled then '%s-write' % $._config.ssd.pod_prefix_matcher else '(ingester.*|partition-ingester.*)'))],
+                                 querier: if $._config.meta_monitoring.enabled
+                                 then [utils.selector.re('job', '($namespace)/(querier|%s-read|loki-single-binary)' % $._config.ssd.pod_prefix_matcher)]
+                                 else [utils.selector.re('job', '($namespace)/%s' % (if $._config.ssd.enabled then '%s-read' % $._config.ssd.pod_prefix_matcher else 'querier'))],
+                                 queryFrontend: if $._config.meta_monitoring.enabled
+                                 then [utils.selector.re('job', '($namespace)/(query-frontend|%s-read|loki-single-binary)' % $._config.ssd.pod_prefix_matcher)]
+                                 else [utils.selector.re('job', '($namespace)/%s' % (if $._config.ssd.enabled then '%s-read' % $._config.ssd.pod_prefix_matcher else 'query-frontend'))],
+                                 backend: [utils.selector.re('job', '($namespace)/%s-backend' % $._config.ssd.pod_prefix_matcher)],
                                },
 
                                podMatchers:: {
                                  cortexgateway: [utils.selector.re('pod', 'cortex-gw')],
-                                 distributor: [utils.selector.re('pod', '%s' % (if $._config.ssd.enabled then '%s-write.*' % $._config.ssd.pod_prefix_matcher else 'distributor.*'))],
-                                 ingester: [utils.selector.re('pod', '%s' % (if $._config.ssd.enabled then '%s-write.*' % $._config.ssd.pod_prefix_matcher else 'ingester.*'))],
-                                 querier: [utils.selector.re('pod', '%s' % (if $._config.ssd.enabled then '%s-read.*' % $._config.ssd.pod_prefix_matcher else 'querier.*'))],
+                                 distributor: if $._config.meta_monitoring.enabled
+                                 then [utils.selector.re('pod', '(distributor|%s-write|loki-single-binary)' % $._config.ssd.pod_prefix_matcher)]
+                                 else [utils.selector.re('pod', '%s' % (if $._config.ssd.enabled then '%s-write.*' % $._config.ssd.pod_prefix_matcher else 'distributor.*'))],
+                                 ingester: if $._config.meta_monitoring.enabled
+                                 then [utils.selector.re('pod', '(partition-ingester.*|ingester.*|%s-write|loki-single-binary)' % $._config.ssd.pod_prefix_matcher)]
+                                 else [utils.selector.re('pod', '%s' % (if $._config.ssd.enabled then '%s-write.*' % $._config.ssd.pod_prefix_matcher else '(ingester.*|partition-ingester.*)'))],
+                                 querier: if $._config.meta_monitoring.enabled
+                                 then [utils.selector.re('pod', '(querier|%s-read|loki-single-binary)' % $._config.ssd.pod_prefix_matcher)]
+                                 else [utils.selector.re('pod', '%s' % (if $._config.ssd.enabled then '%s-read.*' % $._config.ssd.pod_prefix_matcher else 'querier.*'))],
+                                 backend: [utils.selector.re('pod', '%s-backend.*' % $._config.ssd.pod_prefix_matcher)],
                                },
                              }
                              + lokiOperational + {
@@ -57,7 +85,22 @@ local utils = import 'mixin-utils/utils.libsonnet';
 
                                local replaceClusterMatchers(expr) =
                                  if dashboards['loki-operational.json'].showMultiCluster
-                                 then expr
+                                 // Replace the recording rules cluster label with the per-cluster label
+                                 then std.strReplace(
+                                   // Replace the cluster label for equality matchers with the per-cluster label
+                                   std.strReplace(
+                                     // Replace the cluster label for regex matchers with the per-cluster label
+                                     std.strReplace(
+                                       expr,
+                                       'cluster=~"$cluster"',
+                                       $._config.per_cluster_label + '=~"$cluster"'
+                                     ),
+                                     'cluster="$cluster"',
+                                     $._config.per_cluster_label + '="$cluster"'
+                                   ),
+                                   'cluster_job',
+                                   $._config.per_cluster_label + '_job'
+                                 )
                                  else
                                    std.strReplace(
                                      std.strReplace(
@@ -73,6 +116,36 @@ local utils = import 'mixin-utils/utils.libsonnet';
                                      ''
                                    ),
 
+                               local replaceBackendMatchers(expr) =
+                                 std.strReplace(
+                                   std.strReplace(
+                                     std.strReplace(
+                                       expr,
+                                       'pod=~"backend.*"',
+                                       matcherStr('backend', matcher='pod', sep='')
+                                     ),
+                                     'job="$namespace/backend",',
+                                     matcherStr('backend')
+                                   ),
+                                   'job="$namespace/backend"',
+                                   std.rstripChars(matcherStr('backend'), ',')
+                                 ),
+
+                               local replaceQuerierMatchers(expr) =
+                                 std.strReplace(
+                                   std.strReplace(
+                                     std.strReplace(
+                                       expr,
+                                       'pod=~"querier.*"',
+                                       matcherStr('querier', matcher='pod', sep='')
+                                     ),
+                                     'job="$namespace/querier",',
+                                     matcherStr('querier')
+                                   ),
+                                   'job="$namespace/querier"',
+                                   std.rstripChars(matcherStr('querier'), ',')
+                                 ),
+
                                local replaceMatchers(expr) =
                                  std.strReplace(
                                    std.strReplace(
@@ -86,58 +159,50 @@ local utils = import 'mixin-utils/utils.libsonnet';
                                                    std.strReplace(
                                                      std.strReplace(
                                                        std.strReplace(
-                                                         std.strReplace(
-                                                           std.strReplace(
-                                                             std.strReplace(
-                                                               expr,
-                                                               'pod=~"querier.*"',
-                                                               matcherStr('querier', matcher='pod', sep='')
-                                                             ),
-                                                             'pod=~"ingester.*"',
-                                                             matcherStr('ingester', matcher='pod', sep='')
-                                                           ),
-                                                           'pod=~"distributor.*"',
-                                                           matcherStr('distributor', matcher='pod', sep='')
-                                                         ),
-                                                         'job="$namespace/cortex-gw",',
-                                                         matcherStr('cortexgateway')
+                                                         expr,
+                                                         'pod=~"ingester.*"',
+                                                         matcherStr('ingester', matcher='pod', sep='')
                                                        ),
-                                                       'job="$namespace/cortex-gw"',
-                                                       std.rstripChars(matcherStr('cortexgateway'), ',')
+                                                       'pod=~"distributor.*"',
+                                                       matcherStr('distributor', matcher='pod', sep='')
                                                      ),
-                                                     'job=~"($namespace)/cortex-gw",',
+                                                     'job="$namespace/cortex-gw",',
                                                      matcherStr('cortexgateway')
                                                    ),
-                                                   'job="$namespace/distributor",',
-                                                   matcherStr('distributor')
+                                                   'job="$namespace/cortex-gw"',
+                                                   std.rstripChars(matcherStr('cortexgateway'), ',')
                                                  ),
-                                                 'job="$namespace/distributor"',
-                                                 std.rstripChars(matcherStr('distributor'), ',')
+                                                 'job=~"($namespace)/cortex-gw",',
+                                                 matcherStr('cortexgateway')
                                                ),
-                                               'job=~"($namespace)/distributor",',
+                                               'job="$namespace/distributor",',
                                                matcherStr('distributor')
                                              ),
-                                             'job=~"($namespace)/distributor"',
+                                             'job="$namespace/distributor"',
                                              std.rstripChars(matcherStr('distributor'), ',')
                                            ),
-                                           'job="$namespace/ingester",',
-                                           matcherStr('ingester')
+                                           'job=~"($namespace)/distributor",',
+                                           matcherStr('distributor')
                                          ),
-                                         'job="$namespace/ingester"',
-                                         std.rstripChars(matcherStr('ingester'), ',')
+                                         'job=~"($namespace)/distributor"',
+                                         std.rstripChars(matcherStr('distributor'), ',')
                                        ),
-                                       'job=~"($namespace)/ingester",',
-                                       matcherStr('ingester'),
+                                       'job="$namespace/ingester",',
+                                       matcherStr('ingester')
                                      ),
-                                     'job="$namespace/querier",',
-                                     matcherStr('querier')
+                                     'job="$namespace/ingester"',
+                                     std.rstripChars(matcherStr('ingester'), ',')
                                    ),
-                                   'job="$namespace/querier"',
-                                   std.rstripChars(matcherStr('querier'), ',')
+                                   'job=~"($namespace)/ingester",',
+                                   matcherStr('ingester'),
                                  ),
 
                                local replaceAllMatchers(expr) =
-                                 replaceMatchers(replaceClusterMatchers(expr)),
+                                 replaceBackendMatchers(
+                                   replaceQuerierMatchers(
+                                     replaceMatchers(expr)
+                                   )
+                                 ),
 
                                local selectDatasource(ds) =
                                  if ds == null || ds == '' then ds
@@ -147,12 +212,33 @@ local utils = import 'mixin-utils/utils.libsonnet';
                                local isRowHidden(row) =
                                  std.member(dashboards['loki-operational.json'].hiddenRows, row),
 
+                               local isPanelHidden(panelTitle) =
+                                 std.member(dashboards['loki-operational.json'].hiddenPanels, panelTitle),
+
+                               local replaceCortexGateway(expr, replacement) = if $._config.internal_components then
+                                 expr
+                               else
+                                 std.strReplace(
+                                   expr,
+                                   'job=~"$namespace/cortex-gw(-internal)?"',
+                                   matcherStr(replacement, matcher='job', sep='')
+                                 ),
+
+                               local removeInternalComponents(title, expr) = if (title == 'Queries/Second') then
+                                 replaceCortexGateway(expr, 'queryFrontend')
+                               else if (title == 'Pushes/Second') then
+                                 replaceCortexGateway(expr, 'distributor')
+                               else if (title == 'Push Latency') then
+                                 replaceCortexGateway(expr, 'distributor')
+                               else
+                                 replaceAllMatchers(expr),
+
                                panels: [
                                  p {
                                    datasource: selectDatasource(super.datasource),
                                    targets: if std.objectHas(p, 'targets') then [
                                      e {
-                                       expr: replaceAllMatchers(e.expr),
+                                       expr: removeInternalComponents(p.title, replaceClusterMatchers(e.expr)),
                                      }
                                      for e in p.targets
                                    ] else [],
@@ -161,7 +247,7 @@ local utils = import 'mixin-utils/utils.libsonnet';
                                        datasource: selectDatasource(super.datasource),
                                        targets: if std.objectHas(sp, 'targets') then [
                                          e {
-                                           expr: replaceAllMatchers(e.expr),
+                                           expr: removeInternalComponents(p.title, replaceClusterMatchers(e.expr)),
                                          }
                                          for e in sp.targets
                                        ] else [],
@@ -170,15 +256,17 @@ local utils = import 'mixin-utils/utils.libsonnet';
                                            datasource: selectDatasource(super.datasource),
                                            targets: if std.objectHas(ssp, 'targets') then [
                                              e {
-                                               expr: replaceAllMatchers(e.expr),
+                                               expr: removeInternalComponents(p.title, replaceClusterMatchers(e.expr)),
                                              }
                                              for e in ssp.targets
                                            ] else [],
                                          }
                                          for ssp in sp.panels
+                                         if !(isPanelHidden(ssp.title))
                                        ] else [],
                                      }
                                      for sp in p.panels
+                                     if !(isPanelHidden(sp.title))
                                    ] else [],
                                    title: if !($._config.ssd.enabled && p.type == 'row') then p.title else
                                      if p.title == 'Distributor' then 'Write Path'
@@ -186,7 +274,7 @@ local utils = import 'mixin-utils/utils.libsonnet';
                                      else p.title,
                                  }
                                  for p in super.panels
-                                 if !(p.type == 'row' && isRowHidden(p.title))
+                                 if !(p.type == 'row' && isRowHidden(p.title)) && !(isPanelHidden(p.title))
                                ],
                              } +
                              $.dashboard('Loki / Operational', uid='operational')

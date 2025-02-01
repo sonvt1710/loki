@@ -26,26 +26,39 @@ import (
 	"strings"
 	"time"
 
+	btapb "cloud.google.com/go/bigtable/admin/apiv2/adminpb"
 	btopt "cloud.google.com/go/bigtable/internal/option"
 	"cloud.google.com/go/iam"
 	"cloud.google.com/go/internal/optional"
 	"cloud.google.com/go/longrunning"
 	lroauto "cloud.google.com/go/longrunning/autogen"
-	"github.com/golang/protobuf/ptypes"
-	durpb "github.com/golang/protobuf/ptypes/duration"
 	gax "github.com/googleapis/gax-go/v2"
 	"google.golang.org/api/cloudresourcemanager/v1"
 	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
 	gtransport "google.golang.org/api/transport/grpc"
-	btapb "google.golang.org/genproto/googleapis/bigtable/admin/v2"
-	"google.golang.org/genproto/protobuf/field_mask"
-	"google.golang.org/grpc/codes"
+	"google.golang.org/genproto/googleapis/rpc/status"
 	"google.golang.org/grpc/metadata"
-	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/durationpb"
+	field_mask "google.golang.org/protobuf/types/known/fieldmaskpb"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 const adminAddr = "bigtableadmin.googleapis.com:443"
+const mtlsAdminAddr = "bigtableadmin.mtls.googleapis.com:443"
+
+var errExpiryMissing = errors.New("WithExpiry is a required option")
+
+// ErrPartiallyUnavailable is returned when some locations (clusters) are
+// unavailable. Both partial results (retrieved from available locations)
+// and the error are returned when this exception occurred.
+type ErrPartiallyUnavailable struct {
+	Locations []string // unavailable locations
+}
+
+func (e ErrPartiallyUnavailable) Error() string {
+	return fmt.Sprintf("Unavailable locations: %v", e.Locations)
+}
 
 // AdminClient is a client type for performing admin operations within a specific instance.
 type AdminClient struct {
@@ -61,7 +74,7 @@ type AdminClient struct {
 
 // NewAdminClient creates a new AdminClient for a given project and instance.
 func NewAdminClient(ctx context.Context, project, instance string, opts ...option.ClientOption) (*AdminClient, error) {
-	o, err := btopt.DefaultClientOptions(adminAddr, AdminScope, clientUserAgent)
+	o, err := btopt.DefaultClientOptions(adminAddr, mtlsAdminAddr, AdminScope, clientUserAgent)
 	if err != nil {
 		return nil, err
 	}
@@ -72,7 +85,7 @@ func NewAdminClient(ctx context.Context, project, instance string, opts ...optio
 	o = append(o, opts...)
 	connPool, err := gtransport.DialPool(ctx, o...)
 	if err != nil {
-		return nil, fmt.Errorf("dialing: %v", err)
+		return nil, fmt.Errorf("dialing: %w", err)
 	}
 
 	lroClient, err := lroauto.NewOperationsClient(ctx, gtransport.WithConnPool(connPool))
@@ -102,7 +115,85 @@ func (ac *AdminClient) Close() error {
 }
 
 func (ac *AdminClient) instancePrefix() string {
-	return fmt.Sprintf("projects/%s/instances/%s", ac.project, ac.instance)
+	return instancePrefix(ac.project, ac.instance)
+}
+
+func instancePrefix(project, instance string) string {
+	return fmt.Sprintf("projects/%s/instances/%s", project, instance)
+}
+
+func (ac *AdminClient) backupPath(cluster, instance, backup string) string {
+	return fmt.Sprintf("projects/%s/instances/%s/clusters/%s/backups/%s", ac.project, instance, cluster, backup)
+}
+
+func (ac *AdminClient) authorizedViewPath(table, authorizedView string) string {
+	return fmt.Sprintf("%s/tables/%s/authorizedViews/%s", ac.instancePrefix(), table, authorizedView)
+}
+
+// EncryptionInfo represents the encryption info of a table.
+type EncryptionInfo struct {
+	Status        *Status
+	Type          EncryptionType
+	KMSKeyVersion string
+}
+
+func newEncryptionInfo(pbInfo *btapb.EncryptionInfo) *EncryptionInfo {
+	return &EncryptionInfo{
+		Status:        pbInfo.EncryptionStatus,
+		Type:          EncryptionType(pbInfo.EncryptionType.Number()),
+		KMSKeyVersion: pbInfo.KmsKeyVersion,
+	}
+}
+
+// Status references google.golang.org/grpc/status.
+// It represents an RPC status code, message, and details of EncryptionInfo.
+// https://pkg.go.dev/google.golang.org/grpc/internal/status
+type Status = status.Status
+
+// EncryptionType is the type of encryption for an instance.
+type EncryptionType int32
+
+const (
+	// EncryptionTypeUnspecified is the type was not specified, though data at rest remains encrypted.
+	EncryptionTypeUnspecified EncryptionType = iota
+	// GoogleDefaultEncryption represents that data backing this resource is
+	// encrypted at rest with a key that is fully managed by Google. No key
+	// version or status will be populated. This is the default state.
+	GoogleDefaultEncryption
+	// CustomerManagedEncryption represents that data backing this resource is
+	// encrypted at rest with a key that is managed by the customer.
+	// The in-use version of the key and its status are populated for
+	// CMEK-protected tables.
+	// CMEK-protected backups are pinned to the key version that was in use at
+	// the time the backup was taken. This key version is populated but its
+	// status is not tracked and is reported as `UNKNOWN`.
+	CustomerManagedEncryption
+)
+
+// EncryptionInfoByCluster is a map of cluster name to EncryptionInfo
+type EncryptionInfoByCluster map[string][]*EncryptionInfo
+
+// EncryptionInfo gets the current encryption info for the table across all of the clusters.
+// The returned map will be keyed by cluster id and contain a status for all of the keys in use.
+func (ac *AdminClient) EncryptionInfo(ctx context.Context, table string) (EncryptionInfoByCluster, error) {
+	ctx = mergeOutgoingMetadata(ctx, ac.md)
+
+	res, err := ac.getTable(ctx, table, btapb.Table_ENCRYPTION_VIEW)
+	if err != nil {
+		return nil, err
+	}
+	encryptionInfo := EncryptionInfoByCluster{}
+	for key, cs := range res.ClusterStates {
+		for _, pbInfo := range cs.EncryptionInfo {
+			info := EncryptionInfo{}
+			info.Status = pbInfo.EncryptionStatus
+			info.Type = EncryptionType(pbInfo.EncryptionType.Number())
+			info.KMSKeyVersion = pbInfo.KmsKeyVersion
+			encryptionInfo[key] = append(encryptionInfo[key], &info)
+		}
+	}
+
+	return encryptionInfo, nil
 }
 
 // Tables returns a list of the tables in the instance.
@@ -130,18 +221,109 @@ func (ac *AdminClient) Tables(ctx context.Context) ([]string, error) {
 	return names, nil
 }
 
-// TableConf contains all of the information necessary to create a table with column families.
+// ChangeStreamRetention indicates how long bigtable should retain change data.
+// Minimum is 1 day. Maximum is 7. nil to not change the retention period. 0 to
+// disable change stream retention.
+type ChangeStreamRetention optional.Duration
+
+// DeletionProtection indicates whether the table is protected against data loss
+// i.e. when set to protected, deleting the table, the column families in the table,
+// and the instance containing the table would be prohibited.
+type DeletionProtection int
+
+// None indicates that deletion protection is unset
+// Protected indicates that deletion protection is enabled
+// Unprotected indicates that deletion protection is disabled
+const (
+	None DeletionProtection = iota
+	Protected
+	Unprotected
+)
+
+// TableAutomatedBackupConfig generalizes automated backup configurations.
+// Currently, the only supported type of automated backup configuration
+// is TableAutomatedBackupPolicy.
+type TableAutomatedBackupConfig interface {
+	isTableAutomatedBackupConfig()
+}
+
+// TableAutomatedBackupPolicy defines an automated backup policy for a table.
+// Use nil TableAutomatedBackupPolicy to disable Automated Backups on a table.
+// Use nil for a specific field to ignore that field when updating the policy on a table.
+type TableAutomatedBackupPolicy struct {
+	// How long the automated backups should be retained. The only
+	// supported value at this time is 3 days.
+	RetentionPeriod optional.Duration
+	// How frequently automated backups should occur. The only
+	// supported value at this time is 24 hours.
+	Frequency optional.Duration
+}
+
+func (*TableAutomatedBackupPolicy) isTableAutomatedBackupConfig() {}
+
+func toAutomatedBackupConfigProto(automatedBackupConfig TableAutomatedBackupConfig) (*btapb.Table_AutomatedBackupPolicy_, error) {
+	if automatedBackupConfig == nil {
+		return nil, nil
+	}
+	switch backupConfig := automatedBackupConfig.(type) {
+	case *TableAutomatedBackupPolicy:
+		return backupConfig.toProto()
+	default:
+		return nil, fmt.Errorf("error: Unknown type of automated backup configuration")
+	}
+}
+
+func (abp *TableAutomatedBackupPolicy) toProto() (*btapb.Table_AutomatedBackupPolicy_, error) {
+	pbAutomatedBackupPolicy := &btapb.Table_AutomatedBackupPolicy{
+		RetentionPeriod: durationpb.New(0),
+		Frequency:       durationpb.New(0),
+	}
+	if abp.RetentionPeriod == nil && abp.Frequency == nil {
+		return nil, errors.New("at least one of RetentionPeriod and Frequency must be set")
+	}
+	if abp.RetentionPeriod != nil {
+		pbAutomatedBackupPolicy.RetentionPeriod = durationpb.New(optional.ToDuration(abp.RetentionPeriod))
+	}
+	if abp.Frequency != nil {
+		pbAutomatedBackupPolicy.Frequency = durationpb.New(optional.ToDuration(abp.Frequency))
+	}
+	return &btapb.Table_AutomatedBackupPolicy_{
+		AutomatedBackupPolicy: pbAutomatedBackupPolicy,
+	}, nil
+}
+
+// Family represents a column family with its optional GC policy and value type.
+type Family struct {
+	GCPolicy  GCPolicy
+	ValueType Type
+}
+
+// UpdateTableConf is unused
+type UpdateTableConf struct{}
+
+// TableConf contains all the information necessary to create a table with column families.
 type TableConf struct {
 	TableID   string
 	SplitKeys []string
-	// Families is a map from family name to GCPolicy
+	// DEPRECATED: Use ColumnFamilies instead.
+	// Families is a map from family name to GCPolicy.
+	// Only one of Families or ColumnFamilies may be set.
 	Families map[string]GCPolicy
+	// ColumnFamilies is a map from family name to family configuration.
+	// Only one of Families or ColumnFamilies may be set.
+	ColumnFamilies map[string]Family
+	// DeletionProtection can be none, protected or unprotected
+	// set to protected to make the table protected against data loss
+	DeletionProtection    DeletionProtection
+	ChangeStreamRetention ChangeStreamRetention
+	// Configure an automated backup policy for the table
+	AutomatedBackupConfig TableAutomatedBackupConfig
 }
 
 // CreateTable creates a new table in the instance.
 // This method may return before the table's creation is complete.
 func (ac *AdminClient) CreateTable(ctx context.Context, table string) error {
-	return ac.CreateTableFromConf(ctx, &TableConf{TableID: table})
+	return ac.CreateTableFromConf(ctx, &TableConf{TableID: table, ChangeStreamRetention: nil, DeletionProtection: None})
 }
 
 // CreatePresplitTable creates a new table in the instance.
@@ -150,18 +332,62 @@ func (ac *AdminClient) CreateTable(ctx context.Context, table string) error {
 // spanning the key ranges: [, s1), [s1, s2), [s2, ).
 // This method may return before the table's creation is complete.
 func (ac *AdminClient) CreatePresplitTable(ctx context.Context, table string, splitKeys []string) error {
-	return ac.CreateTableFromConf(ctx, &TableConf{TableID: table, SplitKeys: splitKeys})
+	return ac.CreateTableFromConf(ctx, &TableConf{TableID: table, SplitKeys: splitKeys, ChangeStreamRetention: nil, DeletionProtection: None})
 }
 
 // CreateTableFromConf creates a new table in the instance from the given configuration.
 func (ac *AdminClient) CreateTableFromConf(ctx context.Context, conf *TableConf) error {
+	if conf.TableID == "" {
+		return errors.New("TableID is required")
+	}
 	ctx = mergeOutgoingMetadata(ctx, ac.md)
 	var reqSplits []*btapb.CreateTableRequest_Split
 	for _, split := range conf.SplitKeys {
 		reqSplits = append(reqSplits, &btapb.CreateTableRequest_Split{Key: []byte(split)})
 	}
 	var tbl btapb.Table
-	if conf.Families != nil {
+	// we'd rather not set anything explicitly if users don't specify a value and let the server set the default value.
+	// if DeletionProtection is not set, currently the API will default it to false.
+	if conf.DeletionProtection == Protected {
+		tbl.DeletionProtection = true
+	} else if conf.DeletionProtection == Unprotected {
+		tbl.DeletionProtection = false
+	}
+	if conf.ChangeStreamRetention != nil && conf.ChangeStreamRetention.(time.Duration) != 0 {
+		tbl.ChangeStreamConfig = &btapb.ChangeStreamConfig{}
+		tbl.ChangeStreamConfig.RetentionPeriod = durationpb.New(conf.ChangeStreamRetention.(time.Duration))
+	}
+
+	if conf.AutomatedBackupConfig != nil {
+		proto, err := toAutomatedBackupConfigProto(conf.AutomatedBackupConfig)
+		if err != nil {
+			return err
+		}
+		tbl.AutomatedBackupConfig = proto
+	}
+
+	if conf.Families != nil && conf.ColumnFamilies != nil {
+		return errors.New("only one of Families or ColumnFamilies may be set, not both")
+	}
+
+	if conf.ColumnFamilies != nil {
+		tbl.ColumnFamilies = make(map[string]*btapb.ColumnFamily)
+		for fam, config := range conf.ColumnFamilies {
+			var gcPolicy *btapb.GcRule
+			if config.GCPolicy != nil {
+				gcPolicy = config.GCPolicy.proto()
+			} else {
+				gcPolicy = &btapb.GcRule{}
+			}
+
+			var typeProto *btapb.Type = nil
+			if config.ValueType != nil {
+				typeProto = config.ValueType.proto()
+			}
+
+			tbl.ColumnFamilies[fam] = &btapb.ColumnFamily{GcRule: gcPolicy, ValueType: typeProto}
+		}
+	} else if conf.Families != nil {
 		tbl.ColumnFamilies = make(map[string]*btapb.ColumnFamily)
 		for fam, policy := range conf.Families {
 			tbl.ColumnFamilies[fam] = &btapb.ColumnFamily{GcRule: policy.proto()}
@@ -192,6 +418,143 @@ func (ac *AdminClient) CreateColumnFamily(ctx context.Context, table, family str
 	}
 	_, err := ac.tClient.ModifyColumnFamilies(ctx, req)
 	return err
+}
+
+// CreateColumnFamilyWithConfig creates a new column family in a table with an optional GC policy and value type.
+func (ac *AdminClient) CreateColumnFamilyWithConfig(ctx context.Context, table, family string, config Family) error {
+	ctx = mergeOutgoingMetadata(ctx, ac.md)
+	prefix := ac.instancePrefix()
+
+	cf := &btapb.ColumnFamily{}
+	if config.GCPolicy != nil {
+		cf.GcRule = config.GCPolicy.proto()
+	}
+	if config.ValueType != nil {
+		cf.ValueType = config.ValueType.proto()
+	}
+
+	req := &btapb.ModifyColumnFamiliesRequest{
+		Name: prefix + "/tables/" + table,
+		Modifications: []*btapb.ModifyColumnFamiliesRequest_Modification{{
+			Id:  family,
+			Mod: &btapb.ModifyColumnFamiliesRequest_Modification_Create{Create: cf},
+		}},
+	}
+	_, err := ac.tClient.ModifyColumnFamilies(ctx, req)
+	return err
+}
+
+const (
+	deletionProtectionFieldMask    = "deletion_protection"
+	changeStreamConfigFieldMask    = "change_stream_config"
+	automatedBackupPolicyFieldMask = "automated_backup_policy"
+	retentionPeriodFieldMaskPath   = "retention_period"
+	frequencyFieldMaskPath         = "frequency"
+)
+
+func (ac *AdminClient) newUpdateTableRequestProto(tableID string) (*btapb.UpdateTableRequest, error) {
+	if tableID == "" {
+		return nil, errors.New("TableID is required")
+	}
+	updateMask := &field_mask.FieldMask{
+		Paths: []string{},
+	}
+	req := &btapb.UpdateTableRequest{
+		Table: &btapb.Table{
+			Name: ac.instancePrefix() + "/tables/" + tableID,
+		},
+		UpdateMask: updateMask,
+	}
+	return req, nil
+}
+
+func (ac *AdminClient) updateTableAndWait(ctx context.Context, updateTableRequest *btapb.UpdateTableRequest) error {
+	ctx = mergeOutgoingMetadata(ctx, ac.md)
+
+	lro, err := ac.tClient.UpdateTable(ctx, updateTableRequest)
+	if err != nil {
+		return fmt.Errorf("error from update: %w", err)
+	}
+
+	var tbl btapb.Table
+	op := longrunning.InternalNewOperation(ac.lroClient, lro)
+	err = op.Wait(ctx, &tbl)
+	if err != nil {
+		return fmt.Errorf("error from operation: %v", err)
+	}
+
+	return nil
+}
+
+// UpdateTableDisableChangeStream updates a table to disable change stream for table ID.
+func (ac *AdminClient) UpdateTableDisableChangeStream(ctx context.Context, tableID string) error {
+	req, err := ac.newUpdateTableRequestProto(tableID)
+	if err != nil {
+		return err
+	}
+	req.UpdateMask.Paths = []string{changeStreamConfigFieldMask}
+	return ac.updateTableAndWait(ctx, req)
+}
+
+// UpdateTableWithChangeStream updates a table to with the given table ID and change stream config.
+func (ac *AdminClient) UpdateTableWithChangeStream(ctx context.Context, tableID string, changeStreamRetention ChangeStreamRetention) error {
+	req, err := ac.newUpdateTableRequestProto(tableID)
+	if err != nil {
+		return err
+	}
+	req.UpdateMask.Paths = []string{changeStreamConfigFieldMask + "." + retentionPeriodFieldMaskPath}
+	req.Table.ChangeStreamConfig = &btapb.ChangeStreamConfig{}
+	req.Table.ChangeStreamConfig.RetentionPeriod = durationpb.New(changeStreamRetention.(time.Duration))
+	return ac.updateTableAndWait(ctx, req)
+}
+
+// UpdateTableWithDeletionProtection updates a table with the given table ID and deletion protection parameter.
+func (ac *AdminClient) UpdateTableWithDeletionProtection(ctx context.Context, tableID string, deletionProtection DeletionProtection) error {
+	req, err := ac.newUpdateTableRequestProto(tableID)
+	if err != nil {
+		return err
+	}
+	req.UpdateMask.Paths = []string{deletionProtectionFieldMask}
+	req.Table.DeletionProtection = deletionProtection != Unprotected
+	return ac.updateTableAndWait(ctx, req)
+}
+
+// UpdateTableDisableAutomatedBackupPolicy updates a table to disable automated backups for table ID.
+func (ac *AdminClient) UpdateTableDisableAutomatedBackupPolicy(ctx context.Context, tableID string) error {
+	req, err := ac.newUpdateTableRequestProto(tableID)
+	if err != nil {
+		return err
+	}
+	req.UpdateMask.Paths = []string{automatedBackupPolicyFieldMask}
+	return ac.updateTableAndWait(ctx, req)
+}
+
+// UpdateTableWithAutomatedBackupPolicy updates a table to with the given table ID and automated backup policy config.
+func (ac *AdminClient) UpdateTableWithAutomatedBackupPolicy(ctx context.Context, tableID string, automatedBackupPolicy TableAutomatedBackupPolicy) error {
+	req, err := ac.newUpdateTableRequestProto(tableID)
+	if err != nil {
+		return err
+	}
+	abc, err := toAutomatedBackupConfigProto(&automatedBackupPolicy)
+	if err != nil {
+		return err
+	}
+	// If the AutomatedBackupPolicy is not at least partially specified, or if both fields are 0, then this is an
+	// incorrect configuration for updating the table, and should be rejected. Both fields could be zero if (1)
+	// they are set to zero, or (2) neither field was set and the policy was constructed using toProto().
+	if abc.AutomatedBackupPolicy.RetentionPeriod.Seconds == 0 && abc.AutomatedBackupPolicy.Frequency.Seconds == 0 {
+		return errors.New("Invalid automated backup policy. If you're intending to disable automated backups, please use the UpdateTableDisableAutomatedBackupPolicy method instead")
+	}
+	if abc.AutomatedBackupPolicy.RetentionPeriod.Seconds != 0 {
+		// Update Retention Period
+		req.UpdateMask.Paths = append(req.UpdateMask.Paths, automatedBackupPolicyFieldMask+"."+retentionPeriodFieldMaskPath)
+	}
+	if abc.AutomatedBackupPolicy.Frequency.Seconds != 0 {
+		// Update Frequency
+		req.UpdateMask.Paths = append(req.UpdateMask.Paths, automatedBackupPolicyFieldMask+"."+frequencyFieldMaskPath)
+	}
+	req.Table.AutomatedBackupConfig = abc
+	return ac.updateTableAndWait(ctx, req)
 }
 
 // DeleteTable deletes a table and all of its data.
@@ -225,20 +588,28 @@ type TableInfo struct {
 	// DEPRECATED - This field is deprecated. Please use FamilyInfos instead.
 	Families    []string
 	FamilyInfos []FamilyInfo
+	// DeletionProtection indicates whether the table is protected against data loss
+	// DeletionProtection could be None depending on the table view
+	// for example when using NAME_ONLY, the response does not contain DeletionProtection and the value should be None
+	DeletionProtection    DeletionProtection
+	ChangeStreamRetention ChangeStreamRetention
+	AutomatedBackupConfig TableAutomatedBackupConfig
 }
 
 // FamilyInfo represents information about a column family.
 type FamilyInfo struct {
-	Name     string
-	GCPolicy string
+	Name         string
+	GCPolicy     string
+	FullGCPolicy GCPolicy
+	ValueType    Type
 }
 
-// TableInfo retrieves information about a table.
-func (ac *AdminClient) TableInfo(ctx context.Context, table string) (*TableInfo, error) {
+func (ac *AdminClient) getTable(ctx context.Context, table string, view btapb.Table_View) (*btapb.Table, error) {
 	ctx = mergeOutgoingMetadata(ctx, ac.md)
 	prefix := ac.instancePrefix()
 	req := &btapb.GetTableRequest{
 		Name: prefix + "/tables/" + table,
+		View: view,
 	}
 
 	var res *btapb.Table
@@ -251,27 +622,131 @@ func (ac *AdminClient) TableInfo(ctx context.Context, table string) (*TableInfo,
 	if err != nil {
 		return nil, err
 	}
+	return res, nil
+}
+
+// TableInfo retrieves information about a table.
+func (ac *AdminClient) TableInfo(ctx context.Context, table string) (*TableInfo, error) {
+	ctx = mergeOutgoingMetadata(ctx, ac.md)
+
+	res, err := ac.getTable(ctx, table, btapb.Table_SCHEMA_VIEW)
+	if err != nil {
+		return nil, err
+	}
 
 	ti := &TableInfo{}
 	for name, fam := range res.ColumnFamilies {
 		ti.Families = append(ti.Families, name)
-		ti.FamilyInfos = append(ti.FamilyInfos, FamilyInfo{Name: name, GCPolicy: GCRuleToString(fam.GcRule)})
+		ti.FamilyInfos = append(ti.FamilyInfos, FamilyInfo{
+			Name:         name,
+			GCPolicy:     GCRuleToString(fam.GcRule),
+			FullGCPolicy: gcRuleToPolicy(fam.GcRule),
+			ValueType:    ProtoToType(fam.ValueType),
+		})
 	}
+	// we expect DeletionProtection to be in the response because Table_SCHEMA_VIEW is being used in this function
+	// but when using NAME_ONLY, the response does not contain DeletionProtection and it could be nil
+	if res.DeletionProtection == true {
+		ti.DeletionProtection = Protected
+	} else {
+		ti.DeletionProtection = Unprotected
+	}
+	if res.ChangeStreamConfig != nil && res.ChangeStreamConfig.RetentionPeriod != nil {
+		ti.ChangeStreamRetention = res.ChangeStreamConfig.RetentionPeriod.AsDuration()
+	}
+	if res.AutomatedBackupConfig != nil {
+		switch res.AutomatedBackupConfig.(type) {
+		case *btapb.Table_AutomatedBackupPolicy_:
+			ti.AutomatedBackupConfig = &TableAutomatedBackupPolicy{
+				RetentionPeriod: res.GetAutomatedBackupPolicy().GetRetentionPeriod().AsDuration(),
+				Frequency:       res.GetAutomatedBackupPolicy().GetFrequency().AsDuration(),
+			}
+		default:
+			return nil, fmt.Errorf("error: Unknown type of automated backup configuration")
+		}
+	}
+
 	return ti, nil
+}
+
+type updateFamilyOption struct {
+	ignoreWarnings bool
+}
+
+// GCPolicyOption is deprecated, kept for backwards compatibility, use UpdateFamilyOption in new code
+type GCPolicyOption interface {
+	apply(s *updateFamilyOption)
+}
+
+// UpdateFamilyOption is the interface to update family settings
+type UpdateFamilyOption GCPolicyOption
+
+type ignoreWarnings bool
+
+func (w ignoreWarnings) apply(s *updateFamilyOption) {
+	s.ignoreWarnings = bool(w)
+}
+
+// IgnoreWarnings returns a updateFamilyOption that ignores safety checks when modifying the column families
+func IgnoreWarnings() GCPolicyOption {
+	return ignoreWarnings(true)
 }
 
 // SetGCPolicy specifies which cells in a column family should be garbage collected.
 // GC executes opportunistically in the background; table reads may return data
 // matching the GC policy.
 func (ac *AdminClient) SetGCPolicy(ctx context.Context, table, family string, policy GCPolicy) error {
+	return ac.UpdateFamily(ctx, table, family, Family{GCPolicy: policy})
+}
+
+// SetGCPolicyWithOptions is similar to SetGCPolicy but allows passing options
+func (ac *AdminClient) SetGCPolicyWithOptions(ctx context.Context, table, family string, policy GCPolicy, opts ...GCPolicyOption) error {
+	familyOpts := []UpdateFamilyOption{}
+	for _, opt := range opts {
+		if opt != nil {
+			familyOpts = append(familyOpts, opt.(UpdateFamilyOption))
+		}
+	}
+	return ac.UpdateFamily(ctx, table, family, Family{GCPolicy: policy}, familyOpts...)
+}
+
+// UpdateFamily updates column families' garbage colleciton policies and value type.
+func (ac *AdminClient) UpdateFamily(ctx context.Context, table, familyName string, family Family, opts ...UpdateFamilyOption) error {
 	ctx = mergeOutgoingMetadata(ctx, ac.md)
 	prefix := ac.instancePrefix()
+
+	s := updateFamilyOption{}
+	for _, opt := range opts {
+		if opt != nil {
+			opt.apply(&s)
+		}
+	}
+
+	cf := &btapb.ColumnFamily{}
+	mask := &field_mask.FieldMask{}
+	if family.GCPolicy != nil {
+		cf.GcRule = family.GCPolicy.proto()
+		mask.Paths = append(mask.Paths, "gc_rule")
+
+	}
+	if family.ValueType != nil {
+		cf.ValueType = family.ValueType.proto()
+		mask.Paths = append(mask.Paths, "value_type")
+	}
+
+	// No update
+	if len(mask.Paths) == 0 {
+		return nil
+	}
+
 	req := &btapb.ModifyColumnFamiliesRequest{
 		Name: prefix + "/tables/" + table,
 		Modifications: []*btapb.ModifyColumnFamiliesRequest_Modification{{
-			Id:  family,
-			Mod: &btapb.ModifyColumnFamiliesRequest_Modification_Update{Update: &btapb.ColumnFamily{GcRule: policy.proto()}},
+			Id:         familyName,
+			Mod:        &btapb.ModifyColumnFamiliesRequest_Modification_Update{Update: cf},
+			UpdateMask: mask,
 		}},
+		IgnoreWarnings: s.ignoreWarnings,
 	}
 	_, err := ac.tClient.ModifyColumnFamilies(ctx, req)
 	return err
@@ -341,10 +816,10 @@ func (ac *AdminClient) SnapshotTable(ctx context.Context, table, cluster, snapsh
 	ctx = mergeOutgoingMetadata(ctx, ac.md)
 	prefix := ac.instancePrefix()
 
-	var ttlProto *durpb.Duration
+	var ttlProto *durationpb.Duration
 
 	if ttl > 0 {
-		ttlProto = ptypes.DurationProto(ttl)
+		ttlProto = durationpb.New(ttl)
 	}
 
 	req := &btapb.SnapshotTableRequest{
@@ -399,7 +874,7 @@ func (ac *AdminClient) Snapshots(ctx context.Context, cluster string) *SnapshotI
 		for _, s := range resp.Snapshots {
 			snapshotInfo, err := newSnapshotInfo(s)
 			if err != nil {
-				return "", fmt.Errorf("failed to parse snapshot proto %v", err)
+				return "", fmt.Errorf("failed to parse snapshot proto %w", err)
 			}
 			it.items = append(it.items, snapshotInfo)
 		}
@@ -419,15 +894,15 @@ func newSnapshotInfo(snapshot *btapb.Snapshot) (*SnapshotInfo, error) {
 	tablePathParts := strings.Split(snapshot.SourceTable.Name, "/")
 	tableID := tablePathParts[len(tablePathParts)-1]
 
-	createTime, err := ptypes.Timestamp(snapshot.CreateTime)
-	if err != nil {
-		return nil, fmt.Errorf("invalid createTime: %v", err)
+	if err := snapshot.CreateTime.CheckValid(); err != nil {
+		return nil, fmt.Errorf("invalid createTime: %w", err)
 	}
+	createTime := snapshot.GetCreateTime().AsTime()
 
-	deleteTime, err := ptypes.Timestamp(snapshot.DeleteTime)
-	if err != nil {
+	if err := snapshot.DeleteTime.CheckValid(); err != nil {
 		return nil, fmt.Errorf("invalid deleteTime: %v", err)
 	}
+	deleteTime := snapshot.GetDeleteTime().AsTime()
 
 	return &SnapshotInfo{
 		Name:        name,
@@ -587,13 +1062,24 @@ func (ac *AdminClient) WaitForReplication(ctx context.Context, table string) err
 	}
 }
 
-// TableIAM creates an IAM client specific to a given Instance and Table within the configured project.
+// TableIAM creates an IAM Handle specific to a given Instance and Table within the configured project.
 func (ac *AdminClient) TableIAM(tableID string) *iam.Handle {
 	return iam.InternalNewHandleGRPCClient(ac.tClient,
 		"projects/"+ac.project+"/instances/"+ac.instance+"/tables/"+tableID)
 }
 
+// BackupIAM creates an IAM Handle specific to a given Cluster and Backup.
+func (ac *AdminClient) BackupIAM(cluster, backup string) *iam.Handle {
+	return iam.InternalNewHandleGRPCClient(ac.tClient, ac.backupPath(cluster, ac.instance, backup))
+}
+
+// AuthorizedViewIAM creates an IAM Handle specific to a given Table and AuthorizedView.
+func (ac *AdminClient) AuthorizedViewIAM(table, authorizedView string) *iam.Handle {
+	return iam.InternalNewHandleGRPCClient(ac.tClient, ac.authorizedViewPath(table, authorizedView))
+}
+
 const instanceAdminAddr = "bigtableadmin.googleapis.com:443"
+const mtlsInstanceAdminAddr = "bigtableadmin.mtls.googleapis.com:443"
 
 // InstanceAdminClient is a client type for performing admin operations on instances.
 // These operations can be substantially more dangerous than those provided by AdminClient.
@@ -610,7 +1096,7 @@ type InstanceAdminClient struct {
 
 // NewInstanceAdminClient creates a new InstanceAdminClient for a given project.
 func NewInstanceAdminClient(ctx context.Context, project string, opts ...option.ClientOption) (*InstanceAdminClient, error) {
-	o, err := btopt.DefaultClientOptions(instanceAdminAddr, InstanceAdminScope, clientUserAgent)
+	o, err := btopt.DefaultClientOptions(instanceAdminAddr, mtlsInstanceAdminAddr, InstanceAdminScope, clientUserAgent)
 	if err != nil {
 		return nil, err
 	}
@@ -619,7 +1105,7 @@ func NewInstanceAdminClient(ctx context.Context, project string, opts ...option.
 	o = append(o, opts...)
 	connPool, err := gtransport.DialPool(ctx, o...)
 	if err != nil {
-		return nil, fmt.Errorf("dialing: %v", err)
+		return nil, fmt.Errorf("dialing: %w", err)
 	}
 
 	lroClient, err := lroauto.NewOperationsClient(ctx, gtransport.WithConnPool(connPool))
@@ -671,7 +1157,19 @@ func storageTypeFromProto(st btapb.StorageType) StorageType {
 	return SSD
 }
 
-// InstanceType is the type of the instance
+// InstanceState is the state of the instance. This is output-only.
+type InstanceState int32
+
+const (
+	// NotKnown represents the state of an instance that could not be determined.
+	NotKnown InstanceState = InstanceState(btapb.Instance_STATE_NOT_KNOWN)
+	// Ready represents the state of an instance that has been successfully created.
+	Ready = InstanceState(btapb.Instance_READY)
+	// Creating represents the state of an instance that is currently being created.
+	Creating = InstanceState(btapb.Instance_CREATING)
+)
+
+// InstanceType is the type of the instance.
 type InstanceType int32
 
 const (
@@ -683,9 +1181,11 @@ const (
 
 // InstanceInfo represents information about an instance
 type InstanceInfo struct {
-	Name         string // name of the instance
-	DisplayName  string // display name for UIs
-	InstanceType InstanceType
+	Name          string // name of the instance
+	DisplayName   string // display name for UIs
+	InstanceState InstanceState
+	InstanceType  InstanceType
+	Labels        map[string]string
 }
 
 // InstanceConf contains the information necessary to create an Instance
@@ -695,6 +1195,11 @@ type InstanceConf struct {
 	NumNodes     int32
 	StorageType  StorageType
 	InstanceType InstanceType
+	Labels       map[string]string
+
+	// AutoscalingConfig configures the autoscaling properties on the cluster
+	// created with the instance. It is optional.
+	AutoscalingConfig *AutoscalingConfig
 }
 
 // InstanceWithClustersConfig contains the information necessary to create an Instance
@@ -702,6 +1207,7 @@ type InstanceWithClustersConfig struct {
 	InstanceID, DisplayName string
 	Clusters                []ClusterConfig
 	InstanceType            InstanceType
+	Labels                  map[string]string
 }
 
 var instanceNameRegexp = regexp.MustCompile(`^projects/([^/]+)/instances/([a-z][-a-z0-9]*)$`)
@@ -710,21 +1216,23 @@ var instanceNameRegexp = regexp.MustCompile(`^projects/([^/]+)/instances/([a-z][
 // This method will return when the instance has been created or when an error occurs.
 func (iac *InstanceAdminClient) CreateInstance(ctx context.Context, conf *InstanceConf) error {
 	ctx = mergeOutgoingMetadata(ctx, iac.md)
-	newConfig := InstanceWithClustersConfig{
+	newConfig := &InstanceWithClustersConfig{
 		InstanceID:   conf.InstanceId,
 		DisplayName:  conf.DisplayName,
 		InstanceType: conf.InstanceType,
+		Labels:       conf.Labels,
 		Clusters: []ClusterConfig{
 			{
-				InstanceID:  conf.InstanceId,
-				ClusterID:   conf.ClusterId,
-				Zone:        conf.Zone,
-				NumNodes:    conf.NumNodes,
-				StorageType: conf.StorageType,
+				InstanceID:        conf.InstanceId,
+				ClusterID:         conf.ClusterId,
+				Zone:              conf.Zone,
+				NumNodes:          conf.NumNodes,
+				StorageType:       conf.StorageType,
+				AutoscalingConfig: conf.AutoscalingConfig,
 			},
 		},
 	}
-	return iac.CreateInstanceWithClusters(ctx, &newConfig)
+	return iac.CreateInstanceWithClusters(ctx, newConfig)
 }
 
 // CreateInstanceWithClusters creates a new instance with configured clusters in the project.
@@ -739,8 +1247,12 @@ func (iac *InstanceAdminClient) CreateInstanceWithClusters(ctx context.Context, 
 	req := &btapb.CreateInstanceRequest{
 		Parent:     "projects/" + iac.project,
 		InstanceId: conf.InstanceID,
-		Instance:   &btapb.Instance{DisplayName: conf.DisplayName, Type: btapb.Instance_Type(conf.InstanceType)},
-		Clusters:   clusters,
+		Instance: &btapb.Instance{
+			DisplayName: conf.DisplayName,
+			Type:        btapb.Instance_Type(conf.InstanceType),
+			Labels:      conf.Labels,
+		},
+		Clusters: clusters,
 	}
 
 	lro, err := iac.iClient.CreateInstance(ctx, req)
@@ -774,6 +1286,10 @@ func (iac *InstanceAdminClient) updateInstance(ctx context.Context, conf *Instan
 		ireq.Instance.Type = btapb.Instance_Type(conf.InstanceType)
 		mask.Paths = append(mask.Paths, "type")
 	}
+	if conf.Labels != nil {
+		ireq.Instance.Labels = conf.Labels
+		mask.Paths = append(mask.Paths, "labels")
+	}
 
 	if len(mask.Paths) == 0 {
 		return false, nil
@@ -794,10 +1310,12 @@ func (iac *InstanceAdminClient) updateInstance(ctx context.Context, conf *Instan
 // UpdateInstanceWithClusters updates an instance and its clusters. Updateable
 // fields are instance display name, instance type and cluster size.
 // The provided InstanceWithClustersConfig is used as follows:
-// - InstanceID is required
-// - DisplayName and InstanceType are updated only if they are not empty
-// - ClusterID is required for any provided cluster
-// - All other cluster fields are ignored except for NumNodes, which if set will be updated
+//   - InstanceID is required
+//   - DisplayName and InstanceType are updated only if they are not empty
+//   - ClusterID is required for any provided cluster
+//   - All other cluster fields are ignored except for NumNodes and
+//     AutoscalingConfig, which if set will be updated. If both are provided,
+//     AutoscalingConfig takes precedence.
 //
 // This method may return an error after partially succeeding, for example if the instance is updated
 // but a cluster update fails. If an error is returned, InstanceInfo and Clusters may be called to
@@ -818,14 +1336,19 @@ func (iac *InstanceAdminClient) UpdateInstanceWithClusters(ctx context.Context, 
 
 	// Update any clusters
 	for _, cluster := range conf.Clusters {
-		err := iac.UpdateCluster(ctx, conf.InstanceID, cluster.ClusterID, cluster.NumNodes)
-		if err != nil {
+		var clusterErr error
+		if cluster.AutoscalingConfig != nil {
+			clusterErr = iac.SetAutoscaling(ctx, conf.InstanceID, cluster.ClusterID, *cluster.AutoscalingConfig)
+		} else if cluster.NumNodes > 0 {
+			clusterErr = iac.UpdateCluster(ctx, conf.InstanceID, cluster.ClusterID, cluster.NumNodes)
+		}
+		if clusterErr != nil {
 			if updatedInstance {
 				// We updated the instance, so note that in the error message.
-				return fmt.Errorf("UpdateCluster %q failed %v; however UpdateInstance succeeded",
-					cluster.ClusterID, err)
+				return fmt.Errorf("UpdateCluster %q failed %w; however UpdateInstance succeeded",
+					cluster.ClusterID, clusterErr)
 			}
-			return err
+			return clusterErr
 		}
 	}
 
@@ -840,7 +1363,10 @@ func (iac *InstanceAdminClient) DeleteInstance(ctx context.Context, instanceID s
 	return err
 }
 
-// Instances returns a list of instances in the project.
+// Instances returns a list of instances in the project. If any location
+// (cluster) is unavailable due to some transient conditions, Instances
+// returns partial results and ErrPartiallyUnavailable error with
+// unavailable locations list.
 func (iac *InstanceAdminClient) Instances(ctx context.Context) ([]*InstanceInfo, error) {
 	ctx = mergeOutgoingMetadata(ctx, iac.md)
 	req := &btapb.ListInstancesRequest{
@@ -855,11 +1381,6 @@ func (iac *InstanceAdminClient) Instances(ctx context.Context) ([]*InstanceInfo,
 	if err != nil {
 		return nil, err
 	}
-	if len(res.FailedLocations) > 0 {
-		// We don't have a good way to return a partial result in the face of some zones being unavailable.
-		// Fail the entire request.
-		return nil, status.Errorf(codes.Unavailable, "Failed locations: %v", res.FailedLocations)
-	}
 
 	var is []*InstanceInfo
 	for _, i := range res.Instances {
@@ -868,10 +1389,17 @@ func (iac *InstanceAdminClient) Instances(ctx context.Context) ([]*InstanceInfo,
 			return nil, fmt.Errorf("malformed instance name %q", i.Name)
 		}
 		is = append(is, &InstanceInfo{
-			Name:         m[2],
-			DisplayName:  i.DisplayName,
-			InstanceType: InstanceType(i.Type),
+			Name:          m[2],
+			DisplayName:   i.DisplayName,
+			InstanceState: InstanceState(i.State),
+			InstanceType:  InstanceType(i.Type),
+			Labels:        i.Labels,
 		})
+	}
+	if len(res.FailedLocations) > 0 {
+		// Return partial results and an error in
+		// case of some locations are unavailable.
+		return is, ErrPartiallyUnavailable{res.FailedLocations}
 	}
 	return is, nil
 }
@@ -897,34 +1425,135 @@ func (iac *InstanceAdminClient) InstanceInfo(ctx context.Context, instanceID str
 		return nil, fmt.Errorf("malformed instance name %q", res.Name)
 	}
 	return &InstanceInfo{
-		Name:         m[2],
-		DisplayName:  res.DisplayName,
-		InstanceType: InstanceType(res.Type),
+		Name:          m[2],
+		DisplayName:   res.DisplayName,
+		InstanceState: InstanceState(res.State),
+		InstanceType:  InstanceType(res.Type),
+		Labels:        res.Labels,
 	}, nil
+}
+
+// AutoscalingConfig contains autoscaling configuration for a cluster.
+// For details, see https://cloud.google.com/bigtable/docs/autoscaling.
+type AutoscalingConfig struct {
+	// MinNodes sets the minumum number of nodes in a cluster. MinNodes must
+	// be 1 or greater.
+	MinNodes int
+	// MaxNodes sets the maximum number of nodes in a cluster. MaxNodes must be
+	// equal to or greater than MinNodes.
+	MaxNodes int
+	// CPUTargetPercent sets the CPU utilization target for your cluster's
+	// workload.
+	CPUTargetPercent int
+	// StorageUtilizationPerNode sets the storage usage target, in GB, for
+	// each node in a cluster. This number is limited between 2560 (2.5TiB) and
+	// 5120 (5TiB) for a SSD cluster and between 8192 (8TiB) and 16384 (16 TiB)
+	// for an HDD cluster. If set to zero, the default values are used:
+	// 2560 for SSD and 8192 for HDD.
+	StorageUtilizationPerNode int
+}
+
+func (a *AutoscalingConfig) proto() *btapb.Cluster_ClusterAutoscalingConfig {
+	if a == nil {
+		return nil
+	}
+	return &btapb.Cluster_ClusterAutoscalingConfig{
+		AutoscalingLimits: &btapb.AutoscalingLimits{
+			MinServeNodes: int32(a.MinNodes),
+			MaxServeNodes: int32(a.MaxNodes),
+		},
+		AutoscalingTargets: &btapb.AutoscalingTargets{
+			CpuUtilizationPercent:        int32(a.CPUTargetPercent),
+			StorageUtilizationGibPerNode: int32(a.StorageUtilizationPerNode),
+		},
+	}
 }
 
 // ClusterConfig contains the information necessary to create a cluster
 type ClusterConfig struct {
-	InstanceID, ClusterID, Zone string
-	NumNodes                    int32
-	StorageType                 StorageType
+	// InstanceID specifies the unique name of the instance. Required.
+	InstanceID string
+
+	// ClusterID specifies the unique name of the cluster. Required.
+	ClusterID string
+
+	// Zone specifies the location where this cluster's nodes and storage reside.
+	// For best performance, clients should be located as close as possible to this
+	// cluster. Required.
+	Zone string
+
+	// NumNodes specifies the number of nodes allocated to this cluster. More
+	// nodes enable higher throughput and more consistent performance. One of
+	// NumNodes or AutoscalingConfig is required. If both are set,
+	// AutoscalingConfig takes precedence.
+	NumNodes int32
+
+	// StorageType specifies the type of storage used by this cluster to serve
+	// its parent instance's tables, unless explicitly overridden. Required.
+	StorageType StorageType
+
+	// KMSKeyName is the name of the KMS customer managed encryption key (CMEK)
+	// to use for at-rest encryption of data in this cluster.  If omitted,
+	// Google's default encryption will be used. If specified, the requirements
+	// for this key are:
+	// 1) The Cloud Bigtable service account associated with the
+	//    project that contains the cluster must be granted the
+	//    ``cloudkms.cryptoKeyEncrypterDecrypter`` role on the
+	//    CMEK.
+	// 2) Only regional keys can be used and the region of the
+	//    CMEK key must match the region of the cluster.
+	// 3) All clusters within an instance must use the same CMEK
+	//    key.
+	// Optional. Immutable.
+	KMSKeyName string
+
+	// AutoscalingConfig configures the autoscaling properties on a cluster.
+	// One of NumNodes or AutoscalingConfig is required.
+	AutoscalingConfig *AutoscalingConfig
 }
 
 func (cc *ClusterConfig) proto(project string) *btapb.Cluster {
-	return &btapb.Cluster{
+	cl := &btapb.Cluster{
 		ServeNodes:         cc.NumNodes,
 		DefaultStorageType: cc.StorageType.proto(),
 		Location:           "projects/" + project + "/locations/" + cc.Zone,
+		EncryptionConfig: &btapb.Cluster_EncryptionConfig{
+			KmsKeyName: cc.KMSKeyName,
+		},
 	}
+
+	if asc := cc.AutoscalingConfig; asc != nil {
+		cl.Config = &btapb.Cluster_ClusterConfig_{
+			ClusterConfig: &btapb.Cluster_ClusterConfig{
+				ClusterAutoscalingConfig: asc.proto(),
+			},
+		}
+	}
+	return cl
 }
 
 // ClusterInfo represents information about a cluster.
 type ClusterInfo struct {
-	Name        string      // name of the cluster
-	Zone        string      // GCP zone of the cluster (e.g. "us-central1-a")
-	ServeNodes  int         // number of allocated serve nodes
-	State       string      // state of the cluster
-	StorageType StorageType // the storage type of the cluster
+	// Name is the name of the cluster.
+	Name string
+
+	// Zone is the GCP zone of the cluster (e.g. "us-central1-a").
+	Zone string
+
+	// ServeNodes is the number of allocated serve nodes.
+	ServeNodes int
+
+	// State is the state of the cluster.
+	State string
+
+	// StorageType is the storage type of the cluster.
+	StorageType StorageType
+
+	// KMSKeyName is the customer managed encryption key for the cluster.
+	KMSKeyName string
+
+	// AutoscalingConfig are the configured values for a cluster.
+	AutoscalingConfig *AutoscalingConfig
 }
 
 // CreateCluster creates a new cluster in an instance.
@@ -954,20 +1583,58 @@ func (iac *InstanceAdminClient) DeleteCluster(ctx context.Context, instanceID, c
 	return err
 }
 
-// UpdateCluster updates attributes of a cluster
-func (iac *InstanceAdminClient) UpdateCluster(ctx context.Context, instanceID, clusterID string, serveNodes int32) error {
+// SetAutoscaling enables autoscaling on a cluster. To remove autoscaling, use
+// UpdateCluster. See AutoscalingConfig documentation for deatils.
+func (iac *InstanceAdminClient) SetAutoscaling(ctx context.Context, instanceID, clusterID string, conf AutoscalingConfig) error {
 	ctx = mergeOutgoingMetadata(ctx, iac.md)
 	cluster := &btapb.Cluster{
-		Name:       "projects/" + iac.project + "/instances/" + instanceID + "/clusters/" + clusterID,
-		ServeNodes: serveNodes}
-	lro, err := iac.iClient.UpdateCluster(ctx, cluster)
+		Name: "projects/" + iac.project + "/instances/" + instanceID + "/clusters/" + clusterID,
+		Config: &btapb.Cluster_ClusterConfig_{
+			ClusterConfig: &btapb.Cluster_ClusterConfig{
+				ClusterAutoscalingConfig: conf.proto(),
+			},
+		},
+	}
+	lro, err := iac.iClient.PartialUpdateCluster(ctx, &btapb.PartialUpdateClusterRequest{
+		UpdateMask: &field_mask.FieldMask{
+			Paths: []string{"cluster_config.cluster_autoscaling_config"},
+		},
+		Cluster: cluster,
+	})
 	if err != nil {
 		return err
 	}
 	return longrunning.InternalNewOperation(iac.lroClient, lro).Wait(ctx, nil)
 }
 
-// Clusters lists the clusters in an instance.
+// UpdateCluster updates attributes of a cluster. If Autoscaling is configured
+// for the cluster, it will be removed and replaced by the static number of
+// serve nodes specified.
+func (iac *InstanceAdminClient) UpdateCluster(ctx context.Context, instanceID, clusterID string, serveNodes int32) error {
+	ctx = mergeOutgoingMetadata(ctx, iac.md)
+	cluster := &btapb.Cluster{
+		Name:       "projects/" + iac.project + "/instances/" + instanceID + "/clusters/" + clusterID,
+		ServeNodes: serveNodes,
+		// Explicitly removing autoscaling config (and including it in the field
+		// mask below)
+		Config: nil,
+	}
+	lro, err := iac.iClient.PartialUpdateCluster(ctx, &btapb.PartialUpdateClusterRequest{
+		UpdateMask: &field_mask.FieldMask{
+			Paths: []string{"serve_nodes", "cluster_config.cluster_autoscaling_config"},
+		},
+		Cluster: cluster,
+	})
+	if err != nil {
+		return err
+	}
+	return longrunning.InternalNewOperation(iac.lroClient, lro).Wait(ctx, nil)
+}
+
+// Clusters lists the clusters in an instance. If any location
+// (cluster) is unavailable due to some transient conditions, Clusters
+// returns partial results and ErrPartiallyUnavailable error with
+// unavailable locations list.
 func (iac *InstanceAdminClient) Clusters(ctx context.Context, instanceID string) ([]*ClusterInfo, error) {
 	ctx = mergeOutgoingMetadata(ctx, iac.md)
 	req := &btapb.ListClustersRequest{Parent: "projects/" + iac.project + "/instances/" + instanceID}
@@ -980,18 +1647,34 @@ func (iac *InstanceAdminClient) Clusters(ctx context.Context, instanceID string)
 	if err != nil {
 		return nil, err
 	}
-	// TODO(garyelliott): Deal with failed_locations.
+
 	var cis []*ClusterInfo
 	for _, c := range res.Clusters {
 		nameParts := strings.Split(c.Name, "/")
 		locParts := strings.Split(c.Location, "/")
-		cis = append(cis, &ClusterInfo{
+		kmsKeyName := ""
+		if c.EncryptionConfig != nil {
+			kmsKeyName = c.EncryptionConfig.KmsKeyName
+		}
+		ci := &ClusterInfo{
 			Name:        nameParts[len(nameParts)-1],
 			Zone:        locParts[len(locParts)-1],
 			ServeNodes:  int(c.ServeNodes),
 			State:       c.State.String(),
 			StorageType: storageTypeFromProto(c.DefaultStorageType),
-		})
+			KMSKeyName:  kmsKeyName,
+		}
+		if cfg := c.GetClusterConfig(); cfg != nil {
+			if asc := fromClusterConfigProto(cfg); asc != nil {
+				ci.AutoscalingConfig = asc
+			}
+		}
+		cis = append(cis, ci)
+	}
+	if len(res.FailedLocations) > 0 {
+		// Return partial results and an error in
+		// case of some locations are unavailable.
+		return cis, ErrPartiallyUnavailable{res.FailedLocations}
 	}
 	return cis, nil
 }
@@ -999,7 +1682,9 @@ func (iac *InstanceAdminClient) Clusters(ctx context.Context, instanceID string)
 // GetCluster fetches a cluster in an instance
 func (iac *InstanceAdminClient) GetCluster(ctx context.Context, instanceID, clusterID string) (*ClusterInfo, error) {
 	ctx = mergeOutgoingMetadata(ctx, iac.md)
-	req := &btapb.GetClusterRequest{Name: "projects/" + iac.project + "/instances/" + instanceID + "/clusters/" + clusterID}
+	req := &btapb.GetClusterRequest{
+		Name: fmt.Sprintf("projects/%s/instances/%s/clusters/%s", iac.project, instanceID, clusterID),
+	}
 	var c *btapb.Cluster
 	err := gax.Invoke(ctx, func(ctx context.Context, _ gax.CallSettings) error {
 		var err error
@@ -1010,16 +1695,46 @@ func (iac *InstanceAdminClient) GetCluster(ctx context.Context, instanceID, clus
 		return nil, err
 	}
 
+	kmsKeyName := ""
+	if c.EncryptionConfig != nil {
+		kmsKeyName = c.EncryptionConfig.KmsKeyName
+	}
 	nameParts := strings.Split(c.Name, "/")
 	locParts := strings.Split(c.Location, "/")
-	cis := &ClusterInfo{
+	ci := &ClusterInfo{
 		Name:        nameParts[len(nameParts)-1],
 		Zone:        locParts[len(locParts)-1],
 		ServeNodes:  int(c.ServeNodes),
 		State:       c.State.String(),
 		StorageType: storageTypeFromProto(c.DefaultStorageType),
+		KMSKeyName:  kmsKeyName,
 	}
-	return cis, nil
+	// Use type assertion to handle protobuf oneof type
+	if cfg := c.GetClusterConfig(); cfg != nil {
+		if asc := fromClusterConfigProto(cfg); asc != nil {
+			ci.AutoscalingConfig = asc
+		}
+	}
+	return ci, nil
+}
+
+func fromClusterConfigProto(c *btapb.Cluster_ClusterConfig) *AutoscalingConfig {
+	if c == nil {
+		return nil
+	}
+	if c.ClusterAutoscalingConfig == nil {
+		return nil
+	}
+	got := c.ClusterAutoscalingConfig
+	if got.AutoscalingLimits == nil || got.AutoscalingTargets == nil {
+		return nil
+	}
+	return &AutoscalingConfig{
+		MinNodes:                  int(got.AutoscalingLimits.MinServeNodes),
+		MaxNodes:                  int(got.AutoscalingLimits.MaxServeNodes),
+		CPUTargetPercent:          int(got.AutoscalingTargets.CpuUtilizationPercent),
+		StorageUtilizationPerNode: int(got.AutoscalingTargets.StorageUtilizationGibPerNode),
+	}
 }
 
 // InstanceIAM returns the instance's IAM handle.
@@ -1276,15 +1991,19 @@ func max(x, y int) int {
 // UpdateInstanceAndSyncClusters updates an instance and its clusters, and will synchronize the
 // clusters in the instance with the provided clusters, creating and deleting them as necessary.
 // The provided InstanceWithClustersConfig is used as follows:
-// - InstanceID is required
-// - DisplayName and InstanceType are updated only if they are not empty
-// - ClusterID is required for any provided cluster
-// - Any cluster present in conf.Clusters but not part of the instance will be created using CreateCluster
-//   and the given ClusterConfig.
-// - Any cluster missing from conf.Clusters but present in the instance will be removed from the instance
-//   using DeleteCluster.
-// - Any cluster in conf.Clusters that also exists in the instance will be updated to contain the
-//   provided number of nodes if set.
+//   - InstanceID is required
+//   - DisplayName and InstanceType are updated only if they are not empty
+//   - ClusterID is required for any provided cluster
+//   - Any cluster present in conf.Clusters but not part of the instance will be created using CreateCluster
+//     and the given ClusterConfig.
+//   - Any cluster missing from conf.Clusters but present in the instance will be removed from the instance
+//     using DeleteCluster.
+//   - Any cluster in conf.Clusters that also exists in the instance will be
+//     updated either to contain the provided number of nodes or to use the
+//     provided autoscaling config. If both the number of nodes and autoscaling
+//     are configured, autoscaling takes precedence. If the number of nodes is zero
+//     and autoscaling is not provided in InstanceWithClustersConfig, the cluster
+//     is not updated.
 //
 // This method may return an error after partially succeeding, for example if the instance is updated
 // but a cluster update fails. If an error is returned, InstanceInfo and Clusters may be called to
@@ -1326,16 +2045,25 @@ func UpdateInstanceAndSyncClusters(ctx context.Context, iac *InstanceAdminClient
 		}
 		delete(existingClusterNames, cluster.ClusterID)
 
-		if cluster.NumNodes <= 0 {
-			// We only synchronize clusters with a valid number of nodes.
+		if cluster.NumNodes <= 0 && cluster.AutoscalingConfig == nil {
+			// We only synchronize clusters with a valid number of nodes
+			// or a valid autoscaling config.
 			continue
 		}
 
-		// We simply want to update this cluster
-		err = iac.UpdateCluster(ctx, conf.InstanceID, cluster.ClusterID, cluster.NumNodes)
-		if err != nil {
-			return results, fmt.Errorf("UpdateCluster %q failed %v; Progress: %v",
-				cluster.ClusterID, err, results)
+		// We update teh clusters autoscaling config, or its number of serve
+		// nodes.
+		var updateErr error
+		if cluster.AutoscalingConfig != nil {
+			updateErr = iac.SetAutoscaling(ctx, conf.InstanceID, cluster.ClusterID,
+				*cluster.AutoscalingConfig)
+		} else {
+			updateErr = iac.UpdateCluster(ctx, conf.InstanceID, cluster.ClusterID,
+				cluster.NumNodes)
+		}
+		if updateErr != nil {
+			return results, fmt.Errorf("UpdateCluster %q failed %w; Progress: %v",
+				cluster.ClusterID, updateErr, results)
 		}
 		results.UpdatedClusters = append(results.UpdatedClusters, cluster.ClusterID)
 	}
@@ -1368,7 +2096,7 @@ func UpdateInstanceAndSyncClusters(ctx context.Context, iac *InstanceAdminClient
 			clusterToDelete := nextDeletion.Value.(string)
 			err = iac.DeleteCluster(ctx, conf.InstanceID, clusterToDelete)
 			if err != nil {
-				return results, fmt.Errorf("DeleteCluster %q failed %v; Progress: %v",
+				return results, fmt.Errorf("DeleteCluster %q failed %w; Progress: %v",
 					clusterToDelete, err, results)
 			}
 			results.DeletedClusters = append(results.DeletedClusters, clusterToDelete)
@@ -1384,7 +2112,7 @@ func UpdateInstanceAndSyncClusters(ctx context.Context, iac *InstanceAdminClient
 			clusterToCreate.InstanceID = conf.InstanceID
 			err = iac.CreateCluster(ctx, &clusterToCreate)
 			if err != nil {
-				return results, fmt.Errorf("CreateCluster %v failed %v; Progress: %v",
+				return results, fmt.Errorf("CreateCluster %v failed %w; Progress: %v",
 					clusterToCreate, err, results)
 			}
 			results.CreatedClusters = append(results.CreatedClusters, clusterToCreate.ClusterID)
@@ -1394,4 +2122,646 @@ func UpdateInstanceAndSyncClusters(ctx context.Context, iac *InstanceAdminClient
 	}
 
 	return results, nil
+}
+
+// RestoreTable creates a table from a backup. The table will be created in the same cluster as the backup.
+// To restore a table to a different instance, see RestoreTableFrom.
+func (ac *AdminClient) RestoreTable(ctx context.Context, table, cluster, backup string) error {
+	return ac.RestoreTableFrom(ctx, ac.instance, table, cluster, backup)
+}
+
+// RestoreTableFrom creates a new table in the admin's instance by restoring from the given backup and instance.
+// To restore within the same instance, see RestoreTable.
+// sourceInstance (ex. "my-instance") and sourceCluster (ex. "my-cluster") are the instance and cluster in which the new table will be restored from.
+// tableName (ex. "my-restored-table") will be the name of the newly created table.
+// backupName (ex. "my-backup") is the name of the backup to restore.
+func (ac *AdminClient) RestoreTableFrom(ctx context.Context, sourceInstance, table, sourceCluster, backup string) error {
+	ctx = mergeOutgoingMetadata(ctx, ac.md)
+	parent := ac.instancePrefix()
+	sourceBackupPath := ac.backupPath(sourceCluster, sourceInstance, backup)
+	req := &btapb.RestoreTableRequest{
+		Parent:  parent,
+		TableId: table,
+		Source:  &btapb.RestoreTableRequest_Backup{Backup: sourceBackupPath},
+	}
+	op, err := ac.tClient.RestoreTable(ctx, req)
+	if err != nil {
+		return err
+	}
+	resp := btapb.Table{}
+	return longrunning.InternalNewOperation(ac.lroClient, op).Wait(ctx, &resp)
+}
+
+type backupOptions struct {
+	backupType        *BackupType
+	hotToStandardTime *time.Time
+	expireTime        *time.Time
+}
+
+// BackupOption can be used to specify parameters for backup operations.
+type BackupOption func(*backupOptions)
+
+// WithHotToStandardBackup option can be used to create backup with
+// type [BackupTypeHot] and specify time at which the hot backup will be
+// converted to a standard backup. Once the 'hotToStandardTime' has passed,
+// Cloud Bigtable will convert the hot backup to a standard backup.
+// This value must be greater than the backup creation time by at least 24 hours
+func WithHotToStandardBackup(hotToStandardTime time.Time) BackupOption {
+	return func(bo *backupOptions) {
+		btHot := BackupTypeHot
+		bo.backupType = &btHot
+		bo.hotToStandardTime = &hotToStandardTime
+	}
+}
+
+// WithExpiry option can be used to create backup
+// that expires after time 'expireTime'.
+// Once the 'expireTime' has passed, Cloud Bigtable will delete the backup.
+func WithExpiry(expireTime time.Time) BackupOption {
+	return func(bo *backupOptions) {
+		bo.expireTime = &expireTime
+	}
+}
+
+// WithHotBackup option can be used to create backup
+// with type [BackupTypeHot]
+func WithHotBackup() BackupOption {
+	return func(bo *backupOptions) {
+		btHot := BackupTypeHot
+		bo.backupType = &btHot
+	}
+}
+
+// CreateBackup creates a new backup in the specified cluster from the
+// specified source table with the user-provided expire time.
+func (ac *AdminClient) CreateBackup(ctx context.Context, table, cluster, backup string, expireTime time.Time) error {
+	return ac.CreateBackupWithOptions(ctx, table, cluster, backup, WithExpiry(expireTime))
+}
+
+// CreateBackupWithOptions is similar to CreateBackup but lets the user specify additional options.
+func (ac *AdminClient) CreateBackupWithOptions(ctx context.Context, table, cluster, backup string, opts ...BackupOption) error {
+	ctx = mergeOutgoingMetadata(ctx, ac.md)
+	prefix := ac.instancePrefix()
+
+	o := backupOptions{}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&o)
+		}
+	}
+
+	if o.expireTime == nil {
+		return errExpiryMissing
+	}
+	parsedExpireTime := timestamppb.New(*o.expireTime)
+
+	req := &btapb.CreateBackupRequest{
+		Parent:   prefix + "/clusters/" + cluster,
+		BackupId: backup,
+		Backup: &btapb.Backup{
+			ExpireTime:  parsedExpireTime,
+			SourceTable: prefix + "/tables/" + table,
+		},
+	}
+
+	if o.backupType != nil {
+		req.Backup.BackupType = btapb.Backup_BackupType(*o.backupType)
+	}
+	if o.hotToStandardTime != nil {
+		req.Backup.HotToStandardTime = timestamppb.New(*o.hotToStandardTime)
+	}
+	op, err := ac.tClient.CreateBackup(ctx, req)
+	if err != nil {
+		return err
+	}
+	resp := btapb.Backup{}
+	return longrunning.InternalNewOperation(ac.lroClient, op).Wait(ctx, &resp)
+}
+
+// CopyBackup copies the specified source backup with the user-provided expire time.
+func (ac *AdminClient) CopyBackup(ctx context.Context, sourceCluster, sourceBackup,
+	destProject, destInstance, destCluster, destBackup string, expireTime time.Time) error {
+	ctx = mergeOutgoingMetadata(ctx, ac.md)
+	sourceBackupPath := ac.backupPath(sourceCluster, ac.instance, sourceBackup)
+	destPrefix := instancePrefix(destProject, destInstance)
+	req := &btapb.CopyBackupRequest{
+		Parent:       destPrefix + "/clusters/" + destCluster,
+		BackupId:     destBackup,
+		SourceBackup: sourceBackupPath,
+		ExpireTime:   timestamppb.New(expireTime),
+	}
+
+	op, err := ac.tClient.CopyBackup(ctx, req)
+	if err != nil {
+		return err
+	}
+	resp := btapb.Backup{}
+	return longrunning.InternalNewOperation(ac.lroClient, op).Wait(ctx, &resp)
+}
+
+// Backups returns a BackupIterator for iterating over the backups in a cluster.
+// To list backups across all of the clusters in the instance specify "-" as the cluster.
+func (ac *AdminClient) Backups(ctx context.Context, cluster string) *BackupIterator {
+	ctx = mergeOutgoingMetadata(ctx, ac.md)
+	prefix := ac.instancePrefix()
+	clusterPath := prefix + "/clusters/" + cluster
+
+	it := &BackupIterator{}
+	req := &btapb.ListBackupsRequest{
+		Parent: clusterPath,
+	}
+
+	fetch := func(pageSize int, pageToken string) (string, error) {
+		req.PageToken = pageToken
+		if pageSize > math.MaxInt32 {
+			req.PageSize = math.MaxInt32
+		} else {
+			req.PageSize = int32(pageSize)
+		}
+
+		var resp *btapb.ListBackupsResponse
+		err := gax.Invoke(ctx, func(ctx context.Context, _ gax.CallSettings) error {
+			var err error
+			resp, err = ac.tClient.ListBackups(ctx, req)
+			return err
+		}, retryOptions...)
+		if err != nil {
+			return "", err
+		}
+		for _, s := range resp.Backups {
+			backupInfo, err := newBackupInfo(s)
+			if err != nil {
+				return "", fmt.Errorf("failed to parse backup proto %w", err)
+			}
+			it.items = append(it.items, backupInfo)
+		}
+		return resp.NextPageToken, nil
+	}
+	bufLen := func() int { return len(it.items) }
+	takeBuf := func() interface{} { b := it.items; it.items = nil; return b }
+
+	it.pageInfo, it.nextFunc = iterator.NewPageInfo(fetch, bufLen, takeBuf)
+
+	return it
+}
+
+// newBackupInfo creates a BackupInfo struct from a btapb.Backup protocol buffer.
+func newBackupInfo(backup *btapb.Backup) (*BackupInfo, error) {
+	nameParts := strings.Split(backup.Name, "/")
+	name := nameParts[len(nameParts)-1]
+	tablePathParts := strings.Split(backup.SourceTable, "/")
+	tableID := tablePathParts[len(tablePathParts)-1]
+
+	if err := backup.StartTime.CheckValid(); err != nil {
+		return nil, fmt.Errorf("invalid startTime: %v", err)
+	}
+	startTime := backup.GetStartTime().AsTime()
+
+	if err := backup.EndTime.CheckValid(); err != nil {
+		return nil, fmt.Errorf("invalid endTime: %v", err)
+	}
+	endTime := backup.GetEndTime().AsTime()
+
+	if err := backup.ExpireTime.CheckValid(); err != nil {
+		return nil, fmt.Errorf("invalid expireTime: %v", err)
+	}
+	expireTime := backup.GetExpireTime().AsTime()
+
+	var htsTimePtr *time.Time
+	if backup.GetHotToStandardTime() != nil {
+		if err := backup.GetHotToStandardTime().CheckValid(); err != nil {
+			return nil, fmt.Errorf("invalid HotToStandardTime: %v", err)
+		}
+		htsTime := backup.GetHotToStandardTime().AsTime()
+		htsTimePtr = &htsTime
+	}
+
+	encryptionInfo := newEncryptionInfo(backup.EncryptionInfo)
+	bi := BackupInfo{
+		Name:              name,
+		SourceTable:       tableID,
+		SourceBackup:      backup.SourceBackup,
+		SizeBytes:         backup.SizeBytes,
+		StartTime:         startTime,
+		EndTime:           endTime,
+		ExpireTime:        expireTime,
+		State:             backup.State.String(),
+		EncryptionInfo:    encryptionInfo,
+		BackupType:        BackupType(backup.GetBackupType()),
+		HotToStandardTime: htsTimePtr,
+	}
+
+	return &bi, nil
+}
+
+// BackupIterator is an EntryIterator that iterates over log entries.
+type BackupIterator struct {
+	items    []*BackupInfo
+	pageInfo *iterator.PageInfo
+	nextFunc func() error
+}
+
+// PageInfo supports pagination. See https://godoc.org/google.golang.org/api/iterator package for details.
+func (it *BackupIterator) PageInfo() *iterator.PageInfo {
+	return it.pageInfo
+}
+
+// Next returns the next result. Its second return value is iterator.Done
+// (https://godoc.org/google.golang.org/api/iterator) if there are no more
+// results. Once Next returns Done, all subsequent calls will return Done.
+func (it *BackupIterator) Next() (*BackupInfo, error) {
+	if err := it.nextFunc(); err != nil {
+		return nil, err
+	}
+	item := it.items[0]
+	it.items = it.items[1:]
+	return item, nil
+}
+
+// BackupType denotes the type of the backup.
+type BackupType int32
+
+const (
+	// BackupTypeUnspecified denotes that backup type has not been specified.
+	BackupTypeUnspecified BackupType = 0
+
+	// BackupTypeStandard is the default type for Cloud Bigtable managed backups. Supported for
+	// backups created in both HDD and SSD instances. Requires optimization when
+	// restored to a table in an SSD instance.
+	BackupTypeStandard BackupType = 1
+
+	// BackupTypeHot is a backup type with faster restore to SSD performance. Only supported for
+	// backups created in SSD instances. A new SSD table restored from a hot
+	// backup reaches production performance more quickly than a standard
+	// backup.
+	BackupTypeHot BackupType = 2
+)
+
+// BackupInfo contains backup metadata. This struct is read-only.
+type BackupInfo struct {
+	Name           string
+	SourceTable    string
+	SourceBackup   string
+	SizeBytes      int64
+	StartTime      time.Time
+	EndTime        time.Time
+	ExpireTime     time.Time
+	State          string
+	EncryptionInfo *EncryptionInfo
+	BackupType     BackupType
+
+	// The time at which the hot backup will be converted to a standard backup.
+	// Once the `hot_to_standard_time` has passed, Cloud Bigtable will convert the
+	// hot backup to a standard backup. This value must be greater than the backup
+	// creation time by at least 24 hours
+	//
+	// This field only applies for hot backups.
+	HotToStandardTime *time.Time
+}
+
+// BackupInfo gets backup metadata.
+func (ac *AdminClient) BackupInfo(ctx context.Context, cluster, backup string) (*BackupInfo, error) {
+	ctx = mergeOutgoingMetadata(ctx, ac.md)
+	backupPath := ac.backupPath(cluster, ac.instance, backup)
+
+	req := &btapb.GetBackupRequest{
+		Name: backupPath,
+	}
+
+	var resp *btapb.Backup
+	err := gax.Invoke(ctx, func(ctx context.Context, _ gax.CallSettings) error {
+		var err error
+		resp, err = ac.tClient.GetBackup(ctx, req)
+		return err
+	}, retryOptions...)
+	if err != nil {
+		return nil, err
+	}
+
+	return newBackupInfo(resp)
+}
+
+// DeleteBackup deletes a backup in a cluster.
+func (ac *AdminClient) DeleteBackup(ctx context.Context, cluster, backup string) error {
+	ctx = mergeOutgoingMetadata(ctx, ac.md)
+	backupPath := ac.backupPath(cluster, ac.instance, backup)
+
+	req := &btapb.DeleteBackupRequest{
+		Name: backupPath,
+	}
+	_, err := ac.tClient.DeleteBackup(ctx, req)
+	return err
+}
+
+// UpdateBackup updates the backup metadata in a cluster. The API only supports updating expire time.
+func (ac *AdminClient) UpdateBackup(ctx context.Context, cluster, backup string, expireTime time.Time) error {
+	ctx = mergeOutgoingMetadata(ctx, ac.md)
+	backupPath := ac.backupPath(cluster, ac.instance, backup)
+
+	expireTimestamp := timestamppb.New(expireTime)
+
+	updateMask := &field_mask.FieldMask{}
+	updateMask.Paths = append(updateMask.Paths, "expire_time")
+
+	req := &btapb.UpdateBackupRequest{
+		Backup: &btapb.Backup{
+			Name:       backupPath,
+			ExpireTime: expireTimestamp,
+		},
+		UpdateMask: updateMask,
+	}
+	_, err := ac.tClient.UpdateBackup(ctx, req)
+	return err
+}
+
+// UpdateBackupHotToStandardTime updates the HotToStandardTime of a hot backup.
+func (ac *AdminClient) UpdateBackupHotToStandardTime(ctx context.Context, cluster, backup string, hotToStandardTime time.Time) error {
+	return ac.updateBackupHotToStandardTime(ctx, cluster, backup, &hotToStandardTime)
+}
+
+// UpdateBackupRemoveHotToStandardTime removes the HotToStandardTime of a hot backup.
+func (ac *AdminClient) UpdateBackupRemoveHotToStandardTime(ctx context.Context, cluster, backup string) error {
+	return ac.updateBackupHotToStandardTime(ctx, cluster, backup, nil)
+}
+
+func (ac *AdminClient) updateBackupHotToStandardTime(ctx context.Context, cluster, backup string, hotToStandardTime *time.Time) error {
+	ctx = mergeOutgoingMetadata(ctx, ac.md)
+	backupPath := ac.backupPath(cluster, ac.instance, backup)
+
+	updateMask := &field_mask.FieldMask{}
+	updateMask.Paths = append(updateMask.Paths, "hot_to_standard_time")
+
+	req := &btapb.UpdateBackupRequest{
+		Backup: &btapb.Backup{
+			Name: backupPath,
+		},
+		UpdateMask: updateMask,
+	}
+
+	if hotToStandardTime != nil {
+		req.Backup.HotToStandardTime = timestamppb.New(*hotToStandardTime)
+	}
+
+	_, err := ac.tClient.UpdateBackup(ctx, req)
+	return err
+}
+
+// AuthorizedViewConf contains information about an authorized view.
+type AuthorizedViewConf struct {
+	TableID          string
+	AuthorizedViewID string
+
+	// Types that are valid to be assigned to AuthorizedView:
+	//  *SubsetViewConf
+	AuthorizedView     isAuthorizedView
+	DeletionProtection DeletionProtection
+}
+
+// A private interface that currently only implemented by SubsetViewConf, ensuring that only SubsetViewConf instances are accepted as an AuthorizedView.
+// In the future if a new type of AuthorizedView is introduced, it should also implements this interface.
+type isAuthorizedView interface {
+	isAuthorizedView()
+}
+
+func (av AuthorizedViewConf) proto() *btapb.AuthorizedView {
+	var avp btapb.AuthorizedView
+
+	switch dp := av.DeletionProtection; dp {
+	case Protected:
+		avp.DeletionProtection = true
+	case Unprotected:
+		avp.DeletionProtection = false
+	default:
+		break
+	}
+
+	switch avt := av.AuthorizedView.(type) {
+	case *SubsetViewConf:
+		avp.AuthorizedView = &btapb.AuthorizedView_SubsetView_{
+			SubsetView: avt.proto(),
+		}
+	default:
+		break
+	}
+	return &avp
+}
+
+// FamilySubset represents a subset of a column family.
+type FamilySubset struct {
+	Qualifiers        [][]byte
+	QualifierPrefixes [][]byte
+}
+
+// SubsetViewConf contains configuration specific to an authorized view of subset view type.
+type SubsetViewConf struct {
+	RowPrefixes   [][]byte
+	FamilySubsets map[string]FamilySubset
+}
+
+func (*SubsetViewConf) isAuthorizedView() {}
+
+// AddRowPrefix adds a new row prefix to the subset view.
+func (s *SubsetViewConf) AddRowPrefix(prefix []byte) {
+	s.RowPrefixes = append(s.RowPrefixes, prefix)
+}
+
+func (s *SubsetViewConf) getOrCreateFamilySubset(familyName string) FamilySubset {
+	if s.FamilySubsets == nil {
+		s.FamilySubsets = make(map[string]FamilySubset)
+	}
+	if _, ok := s.FamilySubsets[familyName]; !ok {
+		s.FamilySubsets[familyName] = FamilySubset{}
+	}
+	return s.FamilySubsets[familyName]
+}
+
+func (s SubsetViewConf) proto() *btapb.AuthorizedView_SubsetView {
+	var p btapb.AuthorizedView_SubsetView
+	p.RowPrefixes = append(p.RowPrefixes, s.RowPrefixes...)
+	if p.FamilySubsets == nil {
+		p.FamilySubsets = make(map[string]*btapb.AuthorizedView_FamilySubsets)
+	}
+	for familyName, subset := range s.FamilySubsets {
+		p.FamilySubsets[familyName] = &btapb.AuthorizedView_FamilySubsets{
+			Qualifiers:        subset.Qualifiers,
+			QualifierPrefixes: subset.QualifierPrefixes,
+		}
+	}
+	return &p
+}
+
+// AddFamilySubsetQualifier adds an individual column qualifier to be included in a subset view.
+func (s *SubsetViewConf) AddFamilySubsetQualifier(familyName string, qualifier []byte) {
+	fs := s.getOrCreateFamilySubset(familyName)
+	fs.Qualifiers = append(fs.Qualifiers, qualifier)
+	s.FamilySubsets[familyName] = fs
+}
+
+// AddFamilySubsetQualifierPrefix adds a prefix for column qualifiers to be included in a subset view.
+func (s *SubsetViewConf) AddFamilySubsetQualifierPrefix(familyName string, qualifierPrefix []byte) {
+	fs := s.getOrCreateFamilySubset(familyName)
+	fs.QualifierPrefixes = append(fs.QualifierPrefixes, qualifierPrefix)
+	s.FamilySubsets[familyName] = fs
+}
+
+// CreateAuthorizedView creates a new authorized view in a table.
+func (ac *AdminClient) CreateAuthorizedView(ctx context.Context, conf *AuthorizedViewConf) error {
+	if conf.TableID == "" || conf.AuthorizedViewID == "" {
+		return errors.New("both AuthorizedViewID and TableID are required")
+	}
+	if _, ok := conf.AuthorizedView.(*SubsetViewConf); !ok {
+		return errors.New("SubsetView must be specified in AuthorizedViewConf")
+	}
+
+	ctx = mergeOutgoingMetadata(ctx, ac.md)
+	req := &btapb.CreateAuthorizedViewRequest{
+		Parent:           fmt.Sprintf("%s/tables/%s", ac.instancePrefix(), conf.TableID),
+		AuthorizedViewId: conf.AuthorizedViewID,
+		AuthorizedView:   conf.proto(),
+	}
+	_, err := ac.tClient.CreateAuthorizedView(ctx, req)
+	return err
+}
+
+// AuthorizedViewInfo contains authorized view metadata. This struct is read-only.
+type AuthorizedViewInfo struct {
+	TableID          string
+	AuthorizedViewID string
+
+	AuthorizedView     isAuthorizedViewInfo
+	DeletionProtection DeletionProtection
+}
+
+type isAuthorizedViewInfo interface {
+	isAuthorizedViewInfo()
+}
+
+// SubsetViewInfo contains read-only SubsetView metadata.
+type SubsetViewInfo struct {
+	RowPrefixes   [][]byte
+	FamilySubsets map[string]FamilySubset
+}
+
+func (*SubsetViewInfo) isAuthorizedViewInfo() {}
+
+func (s *SubsetViewInfo) fillInfo(internal *btapb.AuthorizedView_SubsetView) {
+	s.RowPrefixes = [][]byte{}
+	s.RowPrefixes = append(s.RowPrefixes, internal.RowPrefixes...)
+	if s.FamilySubsets == nil {
+		s.FamilySubsets = make(map[string]FamilySubset)
+	}
+	for k, v := range internal.FamilySubsets {
+		s.FamilySubsets[k] = FamilySubset{
+			Qualifiers:        v.Qualifiers,
+			QualifierPrefixes: v.QualifierPrefixes,
+		}
+	}
+}
+
+// AuthorizedViewInfo retrieves information about an authorized view.
+func (ac *AdminClient) AuthorizedViewInfo(ctx context.Context, tableID, authorizedViewID string) (*AuthorizedViewInfo, error) {
+	ctx = mergeOutgoingMetadata(ctx, ac.md)
+	req := &btapb.GetAuthorizedViewRequest{
+		Name: fmt.Sprintf("%s/tables/%s/authorizedViews/%s", ac.instancePrefix(), tableID, authorizedViewID),
+	}
+	var res *btapb.AuthorizedView
+
+	err := gax.Invoke(ctx, func(ctx context.Context, _ gax.CallSettings) error {
+		var err error
+		res, err = ac.tClient.GetAuthorizedView(ctx, req)
+		return err
+	}, retryOptions...)
+
+	if err != nil {
+		return nil, err
+	}
+
+	av := &AuthorizedViewInfo{TableID: tableID, AuthorizedViewID: authorizedViewID}
+	if res.DeletionProtection {
+		av.DeletionProtection = Protected
+	} else {
+		av.DeletionProtection = Unprotected
+	}
+	if res.GetSubsetView() != nil {
+		s := SubsetViewInfo{}
+		s.fillInfo(res.GetSubsetView())
+		av.AuthorizedView = &s
+	}
+	return av, nil
+}
+
+// AuthorizedViews returns a list of the authorized views in the table.
+func (ac *AdminClient) AuthorizedViews(ctx context.Context, tableID string) ([]string, error) {
+	names := []string{}
+	prefix := fmt.Sprintf("%s/tables/%s", ac.instancePrefix(), tableID)
+
+	req := &btapb.ListAuthorizedViewsRequest{
+		Parent: prefix,
+		View:   btapb.AuthorizedView_NAME_ONLY,
+	}
+	var res *btapb.ListAuthorizedViewsResponse
+	err := gax.Invoke(ctx, func(ctx context.Context, _ gax.CallSettings) error {
+		var err error
+		res, err = ac.tClient.ListAuthorizedViews(ctx, req)
+		return err
+	}, retryOptions...)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, av := range res.AuthorizedViews {
+		names = append(names, strings.TrimPrefix(av.Name, prefix+"/authorizedViews/"))
+	}
+	return names, nil
+}
+
+// UpdateAuthorizedViewConf contains all the information necessary to update or partial update an authorized view.
+type UpdateAuthorizedViewConf struct {
+	AuthorizedViewConf AuthorizedViewConf
+	IgnoreWarnings     bool
+}
+
+// UpdateAuthorizedView updates an authorized view in a table according to the given configuration.
+func (ac *AdminClient) UpdateAuthorizedView(ctx context.Context, conf UpdateAuthorizedViewConf) error {
+	ctx = mergeOutgoingMetadata(ctx, ac.md)
+	if conf.AuthorizedViewConf.TableID == "" || conf.AuthorizedViewConf.AuthorizedViewID == "" {
+		return errors.New("both AuthorizedViewID and TableID is required")
+	}
+	av := conf.AuthorizedViewConf.proto()
+	av.Name = ac.authorizedViewPath(conf.AuthorizedViewConf.TableID, conf.AuthorizedViewConf.AuthorizedViewID)
+
+	updateMask := &field_mask.FieldMask{
+		Paths: []string{},
+	}
+	if conf.AuthorizedViewConf.DeletionProtection != None {
+		updateMask.Paths = append(updateMask.Paths, "deletion_protection")
+	}
+	if _, ok := conf.AuthorizedViewConf.AuthorizedView.(*SubsetViewConf); ok {
+		updateMask.Paths = append(updateMask.Paths, "subset_view")
+	}
+	req := &btapb.UpdateAuthorizedViewRequest{
+		AuthorizedView: av,
+		UpdateMask:     updateMask,
+		IgnoreWarnings: conf.IgnoreWarnings,
+	}
+	lro, err := ac.tClient.UpdateAuthorizedView(ctx, req)
+	if err != nil {
+		return fmt.Errorf("error from update authorized view: %w", err)
+	}
+	var res btapb.AuthorizedView
+	op := longrunning.InternalNewOperation(ac.lroClient, lro)
+	if err = op.Wait(ctx, &res); err != nil {
+		return fmt.Errorf("error from operation: %v", err)
+	}
+	return nil
+}
+
+// DeleteAuthorizedView deletes an authorized view in a table.
+func (ac *AdminClient) DeleteAuthorizedView(ctx context.Context, tableID, authorizedViewID string) error {
+	ctx = mergeOutgoingMetadata(ctx, ac.md)
+	req := &btapb.DeleteAuthorizedViewRequest{
+		Name: ac.authorizedViewPath(tableID, authorizedViewID),
+	}
+	_, err := ac.tClient.DeleteAuthorizedView(ctx, req)
+	return err
 }

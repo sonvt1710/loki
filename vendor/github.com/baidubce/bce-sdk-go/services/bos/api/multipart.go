@@ -39,11 +39,12 @@ import (
 //     - *InitiateMultipartUploadResult: the result data structure
 //     - error: nil if ok otherwise the specific error
 func InitiateMultipartUpload(cli bce.Client, bucket, object, contentType string,
-	args *InitiateMultipartUploadArgs) (*InitiateMultipartUploadResult, error) {
+	args *InitiateMultipartUploadArgs, ctx *BosContext) (*InitiateMultipartUploadResult, error) {
 	req := &bce.BceRequest{}
 	req.SetUri(getObjectUri(bucket, object))
 	req.SetMethod(http.POST)
 	req.SetParam("uploads", "")
+	ctx.Bucket = bucket
 	if len(contentType) == 0 {
 		contentType = RAW_CONTENT_TYPE
 	}
@@ -65,11 +66,19 @@ func InitiateMultipartUpload(cli bce.Client, bucket, object, contentType string,
 					args.StorageClass)
 			}
 		}
+		if len(args.ObjectTagging) != 0 {
+			if ok, encodeTagging := validObjectTagging(args.ObjectTagging); ok {
+				req.SetHeader(http.BCE_OBJECT_TAGGING, encodeTagging)
+			}
+		}
+		if validMetadataDirective(args.TaggingDirective) {
+			req.SetHeader(http.BCE_COPY_TAGGING_DIRECTIVE, args.TaggingDirective)
+		}
 	}
 
 	// Send request and get the result
 	resp := &bce.BceResponse{}
-	if err := SendRequest(cli, req, resp); err != nil {
+	if err := SendRequest(cli, req, resp, ctx); err != nil {
 		return nil, err
 	}
 	if resp.IsFail() {
@@ -97,12 +106,13 @@ func InitiateMultipartUpload(cli bce.Client, bucket, object, contentType string,
 //     - string: the etag of the uploaded part
 //     - error: nil if ok otherwise the specific error
 func UploadPart(cli bce.Client, bucket, object, uploadId string, partNumber int,
-	content *bce.Body, args *UploadPartArgs) (string, error) {
+	content *bce.Body, args *UploadPartArgs, ctx *BosContext) (string, error) {
 	req := &bce.BceRequest{}
 	req.SetUri(getObjectUri(bucket, object))
 	req.SetMethod(http.PUT)
 	req.SetParam("uploadId", uploadId)
 	req.SetParam("partNumber", fmt.Sprintf("%d", partNumber))
+	ctx.Bucket = bucket
 	if content == nil {
 		return "", bce.NewBceClientError("upload part content should not be empty")
 	}
@@ -118,11 +128,19 @@ func UploadPart(cli bce.Client, bucket, object, uploadId string, partNumber int,
 			http.BCE_CONTENT_SHA256: args.ContentSha256,
 			http.BCE_CONTENT_CRC32:  args.ContentCrc32,
 		})
+		//set traffic-limit
+		if args.TrafficLimit > 0 {
+			if args.TrafficLimit > TRAFFIC_LIMIT_MAX || args.TrafficLimit < TRAFFIC_LIMIT_MIN {
+				return "", bce.NewBceClientError(fmt.Sprintf("TrafficLimit must between %d ~ %d, current value:%d", TRAFFIC_LIMIT_MIN, TRAFFIC_LIMIT_MAX, args.TrafficLimit))
+			}
+			req.SetHeader(http.BCE_TRAFFIC_LIMIT, fmt.Sprintf("%d", args.TrafficLimit))
+		}
+
 	}
 
 	// Send request and get the result
 	resp := &bce.BceResponse{}
-	if err := SendRequest(cli, req, resp); err != nil {
+	if err := SendRequest(cli, req, resp, ctx); err != nil {
 		return "", err
 	}
 	if resp.IsFail() {
@@ -146,12 +164,13 @@ func UploadPart(cli bce.Client, bucket, object, uploadId string, partNumber int,
 //     - string: the etag of the uploaded part
 //     - error: nil if ok otherwise the specific error
 func UploadPartFromBytes(cli bce.Client, bucket, object, uploadId string, partNumber int,
-	content []byte, args *UploadPartArgs) (string, error) {
+	content []byte, args *UploadPartArgs, ctx *BosContext) (string, error) {
 	req := &bce.BceRequest{}
 	req.SetUri(getObjectUri(bucket, object))
 	req.SetMethod(http.PUT)
 	req.SetParam("uploadId", uploadId)
 	req.SetParam("partNumber", fmt.Sprintf("%d", partNumber))
+	ctx.Bucket = bucket
 	if content == nil {
 		return "", bce.NewBceClientError("upload part content should not be empty")
 	}
@@ -180,10 +199,18 @@ func UploadPartFromBytes(cli bce.Client, bucket, object, uploadId string, partNu
 			http.BCE_CONTENT_SHA256: args.ContentSha256,
 			http.BCE_CONTENT_CRC32:  args.ContentCrc32,
 		})
+		//set traffic-limit
+		if args.TrafficLimit > 0 {
+			if args.TrafficLimit > TRAFFIC_LIMIT_MAX || args.TrafficLimit < TRAFFIC_LIMIT_MIN {
+				return "", bce.NewBceClientError(fmt.Sprintf("TrafficLimit must between %d ~ %d, current value:%d",
+					TRAFFIC_LIMIT_MIN, TRAFFIC_LIMIT_MAX, args.TrafficLimit))
+			}
+			req.SetHeader(http.BCE_TRAFFIC_LIMIT, fmt.Sprintf("%d", args.TrafficLimit))
+		}
 	}
 	// Send request and get the result
 	resp := &bce.BceResponse{}
-	if err := cli.SendRequestFromBytes(req, resp, content); err != nil {
+	if err := SendRequestFromBytes(cli, req, resp, ctx, content); err != nil {
 		return "", err
 	}
 	if resp.IsFail() {
@@ -207,12 +234,13 @@ func UploadPartFromBytes(cli bce.Client, bucket, object, uploadId string, partNu
 //     - *CopyObjectResult: the lastModified and eTag of the part
 //     - error: nil if ok otherwise the specific error
 func UploadPartCopy(cli bce.Client, bucket, object, source, uploadId string, partNumber int,
-	args *UploadPartCopyArgs) (*CopyObjectResult, error) {
+	args *UploadPartCopyArgs, ctx *BosContext) (*CopyObjectResult, error) {
 	req := &bce.BceRequest{}
 	req.SetUri(getObjectUri(bucket, object))
 	req.SetMethod(http.PUT)
 	req.SetParam("uploadId", uploadId)
 	req.SetParam("partNumber", fmt.Sprintf("%d", partNumber))
+	ctx.Bucket = bucket
 	if len(source) == 0 {
 		return nil, bce.NewBceClientError("upload part copy source should not be empty")
 	}
@@ -227,11 +255,18 @@ func UploadPartCopy(cli bce.Client, bucket, object, source, uploadId string, par
 			http.BCE_COPY_SOURCE_IF_MODIFIED_SINCE:   args.IfModifiedSince,
 			http.BCE_COPY_SOURCE_IF_UNMODIFIED_SINCE: args.IfUnmodifiedSince,
 		})
+		//set traffic-limit
+		if args.TrafficLimit > 0 {
+			if args.TrafficLimit > TRAFFIC_LIMIT_MAX || args.TrafficLimit < TRAFFIC_LIMIT_MIN {
+				return nil, bce.NewBceClientError(fmt.Sprintf("TrafficLimit must between %d ~ %d, current value:%d", TRAFFIC_LIMIT_MIN, TRAFFIC_LIMIT_MAX, args.TrafficLimit))
+			}
+			req.SetHeader(http.BCE_TRAFFIC_LIMIT, fmt.Sprintf("%d", args.TrafficLimit))
+		}
 	}
 
 	// Send request and get the result
 	resp := &bce.BceResponse{}
-	if err := SendRequest(cli, req, resp); err != nil {
+	if err := SendRequest(cli, req, resp, ctx); err != nil {
 		return nil, err
 	}
 	if resp.IsFail() {
@@ -257,11 +292,12 @@ func UploadPartCopy(cli bce.Client, bucket, object, source, uploadId string, par
 //     - *CompleteMultipartUploadResult: the result data
 //     - error: nil if ok otherwise the specific error
 func CompleteMultipartUpload(cli bce.Client, bucket, object, uploadId string,
-	body *bce.Body, args *CompleteMultipartUploadArgs) (*CompleteMultipartUploadResult, error) {
+	body *bce.Body, args *CompleteMultipartUploadArgs, ctx *BosContext) (*CompleteMultipartUploadResult, error) {
 	req := &bce.BceRequest{}
 	req.SetUri(getObjectUri(bucket, object))
 	req.SetMethod(http.POST)
 	req.SetParam("uploadId", uploadId)
+	ctx.Bucket = bucket
 	if body == nil {
 		return nil, bce.NewBceClientError("upload body info should not be emtpy")
 	}
@@ -285,7 +321,7 @@ func CompleteMultipartUpload(cli bce.Client, bucket, object, uploadId string,
 
 	// Send request and get the result
 	resp := &bce.BceResponse{}
-	if err := SendRequest(cli, req, resp); err != nil {
+	if err := SendRequest(cli, req, resp, ctx); err != nil {
 		return nil, err
 	}
 	if resp.IsFail() {
@@ -311,14 +347,14 @@ func CompleteMultipartUpload(cli bce.Client, bucket, object, uploadId string,
 //     - uploadId: the multipart upload id
 // RETURNS:
 //     - error: nil if ok otherwise the specific error
-func AbortMultipartUpload(cli bce.Client, bucket, object, uploadId string) error {
+func AbortMultipartUpload(cli bce.Client, bucket, object, uploadId string, ctx *BosContext) error {
 	req := &bce.BceRequest{}
 	req.SetUri(getObjectUri(bucket, object))
 	req.SetMethod(http.DELETE)
 	req.SetParam("uploadId", uploadId)
-
+	ctx.Bucket = bucket
 	resp := &bce.BceResponse{}
-	if err := SendRequest(cli, req, resp); err != nil {
+	if err := SendRequest(cli, req, resp, ctx); err != nil {
 		return err
 	}
 	if resp.IsFail() {
@@ -342,12 +378,12 @@ func AbortMultipartUpload(cli bce.Client, bucket, object, uploadId string) error
 //     - *ListPartsResult: the uploaded parts info result
 //     - error: nil if ok otherwise the specific error
 func ListParts(cli bce.Client, bucket, object, uploadId string,
-	args *ListPartsArgs) (*ListPartsResult, error) {
+	args *ListPartsArgs, ctx *BosContext) (*ListPartsResult, error) {
 	req := &bce.BceRequest{}
 	req.SetUri(getObjectUri(bucket, object))
 	req.SetMethod(http.GET)
 	req.SetParam("uploadId", uploadId)
-
+	ctx.Bucket = bucket
 	// Optional arguments settings
 	if args != nil {
 		if len(args.PartNumberMarker) > 0 {
@@ -360,7 +396,7 @@ func ListParts(cli bce.Client, bucket, object, uploadId string,
 
 	// Send request and get the result
 	resp := &bce.BceResponse{}
-	if err := SendRequest(cli, req, resp); err != nil {
+	if err := SendRequest(cli, req, resp, ctx); err != nil {
 		return nil, err
 	}
 	if resp.IsFail() {
@@ -383,11 +419,12 @@ func ListParts(cli bce.Client, bucket, object, uploadId string,
 //     - *ListMultipartUploadsResult: the unfinished uploaded parts info result
 //     - error: nil if ok otherwise the specific error
 func ListMultipartUploads(cli bce.Client, bucket string,
-	args *ListMultipartUploadsArgs) (*ListMultipartUploadsResult, error) {
+	args *ListMultipartUploadsArgs, ctx *BosContext) (*ListMultipartUploadsResult, error) {
 	req := &bce.BceRequest{}
 	req.SetUri(getBucketUri(bucket))
 	req.SetMethod(http.GET)
 	req.SetParam("uploads", "")
+	ctx.Bucket = bucket
 
 	// Optional arguments settings
 	if args != nil {
@@ -407,7 +444,7 @@ func ListMultipartUploads(cli bce.Client, bucket string,
 
 	// Send request and get the result
 	resp := &bce.BceResponse{}
-	if err := SendRequest(cli, req, resp); err != nil {
+	if err := SendRequest(cli, req, resp, ctx); err != nil {
 		return nil, err
 	}
 	if resp.IsFail() {
