@@ -3,14 +3,13 @@ package logqlanalyzer
 import (
 	"fmt"
 	"time"
-	"unsafe"
 
 	"github.com/pkg/errors"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/promql/parser"
 
-	"github.com/grafana/loki/pkg/logql/log"
-	"github.com/grafana/loki/pkg/logql/syntax"
+	"github.com/grafana/loki/v3/pkg/logql/log"
+	"github.com/grafana/loki/v3/pkg/logql/syntax"
 )
 
 type logQLAnalyzer struct {
@@ -131,7 +130,7 @@ type StageAnalysisRecorder struct {
 }
 
 func (s StageAnalysisRecorder) Process(ts int64, line []byte, lbs *log.LabelsBuilder) ([]byte, bool) {
-	lineBefore := unsafeGetString(line)
+	lineBefore := string(line)
 	labelsBefore := lbs.UnsortedLabels(nil)
 
 	lineResult, ok := s.origin.Process(ts, line, lbs)
@@ -141,7 +140,7 @@ func (s StageAnalysisRecorder) Process(ts int64, line []byte, lbs *log.LabelsBui
 		LabelsBefore: labelsBefore,
 		LineBefore:   lineBefore,
 		LabelsAfter:  lbs.UnsortedLabels(nil),
-		LineAfter:    unsafeGetString(lineResult),
+		LineAfter:    string(lineResult),
 		FilteredOut:  !ok,
 	}
 	return lineResult, ok
@@ -157,8 +156,4 @@ type StageAnalysisRecord struct {
 	LineAfter    string
 	LabelsAfter  labels.Labels
 	FilteredOut  bool
-}
-
-func unsafeGetString(buf []byte) string {
-	return *((*string)(unsafe.Pointer(&buf)))
 }

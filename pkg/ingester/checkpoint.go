@@ -3,6 +3,7 @@ package ingester
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -14,16 +15,16 @@ import (
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/gogo/protobuf/proto"
-	"github.com/pkg/errors"
 	tsdb_errors "github.com/prometheus/prometheus/tsdb/errors"
 	"github.com/prometheus/prometheus/tsdb/fileutil"
-	"github.com/prometheus/prometheus/tsdb/wal"
+	"github.com/prometheus/prometheus/tsdb/wlog"
 	prompool "github.com/prometheus/prometheus/util/pool"
 
-	"github.com/grafana/loki/pkg/chunkenc"
-	"github.com/grafana/loki/pkg/logproto"
-	util_log "github.com/grafana/loki/pkg/util/log"
-	"github.com/grafana/loki/pkg/util/pool"
+	"github.com/grafana/loki/v3/pkg/chunkenc"
+	"github.com/grafana/loki/v3/pkg/ingester/wal"
+	"github.com/grafana/loki/v3/pkg/logproto"
+	util_log "github.com/grafana/loki/v3/pkg/util/log"
+	"github.com/grafana/loki/v3/pkg/util/pool"
 )
 
 var (
@@ -89,7 +90,7 @@ func toWireChunks(descs []chunkDesc, wireChunks []chunkWithBuffer) ([]chunkWithB
 	return wireChunks, nil
 }
 
-func fromWireChunks(conf *Config, wireChunks []Chunk) ([]chunkDesc, error) {
+func fromWireChunks(conf *Config, headfmt chunkenc.HeadBlockFmt, wireChunks []Chunk) ([]chunkDesc, error) {
 	descs := make([]chunkDesc, 0, len(wireChunks))
 	for _, c := range wireChunks {
 		desc := chunkDesc{
@@ -99,11 +100,7 @@ func fromWireChunks(conf *Config, wireChunks []Chunk) ([]chunkDesc, error) {
 			lastUpdated: c.LastUpdated,
 		}
 
-		// Always use Unordered headblocks during replay
-		// to ensure Loki can effectively replay an unordered-friendly
-		// WAL into a new configuration that disables unordered writes.
-		hbType := chunkenc.UnorderedHeadBlockFmt
-		mc, err := chunkenc.MemchunkFromCheckpoint(c.Data, c.Head, hbType, conf.BlockSize, conf.TargetChunkSize)
+		mc, err := chunkenc.MemchunkFromCheckpoint(c.Data, c.Head, headfmt, conf.BlockSize, conf.TargetChunkSize)
 		if err != nil {
 			return nil, err
 		}
@@ -124,15 +121,15 @@ func decodeCheckpointRecord(rec []byte, s *Series) error {
 	cpy := make([]byte, len(rec))
 	copy(cpy, rec)
 
-	switch RecordType(cpy[0]) {
-	case CheckpointRecord:
+	switch wal.RecordType(cpy[0]) {
+	case wal.CheckpointRecord:
 		return proto.Unmarshal(cpy[1:], s)
 	default:
-		return errors.Errorf("unexpected record type: %d", rec[0])
+		return fmt.Errorf("unexpected record type: %d", rec[0])
 	}
 }
 
-func encodeWithTypeHeader(m *Series, typ RecordType, buf []byte) ([]byte, error) {
+func encodeWithTypeHeader(m *Series, typ wal.RecordType, buf []byte) ([]byte, error) {
 	size := m.Size()
 	if cap(buf) < size+1 {
 		buf = make([]byte, size+1)
@@ -307,7 +304,7 @@ type walLogger interface {
 
 type WALCheckpointWriter struct {
 	metrics    *ingesterMetrics
-	segmentWAL *wal.WAL
+	segmentWAL *wlog.WL
 
 	checkpointWAL walLogger
 	lastSegment   int    // name of the last segment guaranteed to be covered by the checkpoint
@@ -317,7 +314,7 @@ type WALCheckpointWriter struct {
 }
 
 func (w *WALCheckpointWriter) Advance() (bool, error) {
-	_, lastSegment, err := wal.Segments(w.segmentWAL.Dir())
+	_, lastSegment, err := wlog.Segments(w.segmentWAL.Dir())
 	if err != nil {
 		return false, err
 	}
@@ -347,13 +344,13 @@ func (w *WALCheckpointWriter) Advance() (bool, error) {
 		}
 	}
 
-	if err := os.MkdirAll(checkpointDirTemp, 0777); err != nil {
-		return false, errors.Wrap(err, "create checkpoint dir")
+	if err := os.MkdirAll(checkpointDirTemp, 0750); err != nil {
+		return false, fmt.Errorf("create checkpoint dir: %w", err)
 	}
 
-	checkpoint, err := wal.NewSize(log.With(util_log.Logger, "component", "checkpoint_wal"), nil, checkpointDirTemp, walSegmentSize, false)
+	checkpoint, err := wlog.NewSize(util_log.SlogFromGoKit(log.With(util_log.Logger, "component", "checkpoint_wal")), nil, checkpointDirTemp, walSegmentSize, wlog.CompressionNone)
 	if err != nil {
-		return false, errors.Wrap(err, "open checkpoint")
+		return false, fmt.Errorf("open checkpoint: %w", err)
 	}
 
 	w.checkpointWAL = checkpoint
@@ -370,7 +367,7 @@ func (w *WALCheckpointWriter) Write(s *Series) error {
 	size := s.Size() + 1 // +1 for header
 	buf := recordBufferPool.Get(size).([]byte)[:size]
 
-	b, err := encodeWithTypeHeader(s, CheckpointRecord, buf)
+	b, err := encodeWithTypeHeader(s, wal.CheckpointRecord, buf)
 	if err != nil {
 		return err
 	}
@@ -496,7 +493,7 @@ func (w *WALCheckpointWriter) Close(abort bool) error {
 	}
 
 	if err := fileutil.Replace(w.checkpointWAL.Dir(), w.final); err != nil {
-		return errors.Wrap(err, "rename checkpoint directory")
+		return fmt.Errorf("rename checkpoint directory: %w", err)
 	}
 	level.Info(util_log.Logger).Log("msg", "atomic checkpoint finished", "old", w.checkpointWAL.Dir(), "new", w.final)
 	// We delete the WAL segments which are before the previous checkpoint and not before the

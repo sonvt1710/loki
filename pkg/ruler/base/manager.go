@@ -8,6 +8,7 @@ import (
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
+	"github.com/grafana/dskit/user"
 	ot "github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
@@ -16,10 +17,9 @@ import (
 	"github.com/prometheus/prometheus/model/rulefmt"
 	"github.com/prometheus/prometheus/notifier"
 	promRules "github.com/prometheus/prometheus/rules"
-	"github.com/weaveworks/common/user"
 	"golang.org/x/net/context/ctxhttp"
 
-	"github.com/grafana/loki/pkg/ruler/rulespb"
+	"github.com/grafana/loki/v3/pkg/ruler/rulespb"
 )
 
 type DefaultMultiTenantManager struct {
@@ -46,10 +46,21 @@ type DefaultMultiTenantManager struct {
 	configUpdatesTotal            *prometheus.CounterVec
 	registry                      prometheus.Registerer
 	logger                        log.Logger
+	metricsNamespace              string
 }
 
-func NewDefaultMultiTenantManager(cfg Config, managerFactory ManagerFactory, reg prometheus.Registerer, logger log.Logger, limits RulesLimits) (*DefaultMultiTenantManager, error) {
-	userManagerMetrics := NewManagerMetrics(cfg.DisableRuleGroupLabel)
+func NewDefaultMultiTenantManager(cfg Config, managerFactory ManagerFactory, reg prometheus.Registerer, logger log.Logger, limits RulesLimits, metricsNamespace string) (*DefaultMultiTenantManager, error) {
+	userManagerMetrics := NewManagerMetrics(cfg.DisableRuleGroupLabel, func(k, v string) string {
+		// When "by-rule" sharding is enabled, each rule group is assigned a unique name to work around some of Prometheus'
+		// assumptions, and metrics are exported based on these rule group names. If we kept these unique rule group names
+		// in place, this would explode cardinality.
+		if k == RuleGroupLabel {
+			return RemoveRuleTokenFromGroupName(v)
+		}
+
+		return v
+
+	}, metricsNamespace)
 	if reg != nil {
 		reg.MustRegister(userManagerMetrics)
 	}
@@ -63,23 +74,24 @@ func NewDefaultMultiTenantManager(cfg Config, managerFactory ManagerFactory, reg
 		mapper:             newMapper(cfg.RulePath, logger),
 		userManagers:       map[string]RulesManager{},
 		userManagerMetrics: userManagerMetrics,
+		metricsNamespace:   metricsNamespace,
 		managersTotal: promauto.With(reg).NewGauge(prometheus.GaugeOpts{
-			Namespace: "cortex",
+			Namespace: metricsNamespace,
 			Name:      "ruler_managers_total",
 			Help:      "Total number of managers registered and running in the ruler",
 		}),
 		lastReloadSuccessful: promauto.With(reg).NewGaugeVec(prometheus.GaugeOpts{
-			Namespace: "cortex",
+			Namespace: metricsNamespace,
 			Name:      "ruler_config_last_reload_successful",
 			Help:      "Boolean set to 1 whenever the last configuration reload attempt was successful.",
 		}, []string{"user"}),
 		lastReloadSuccessfulTimestamp: promauto.With(reg).NewGaugeVec(prometheus.GaugeOpts{
-			Namespace: "cortex",
+			Namespace: metricsNamespace,
 			Name:      "ruler_config_last_reload_successful_seconds",
 			Help:      "Timestamp of the last successful configuration reload.",
 		}, []string{"user"}),
 		configUpdatesTotal: promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
-			Namespace: "cortex",
+			Namespace: metricsNamespace,
 			Name:      "ruler_config_updates_total",
 			Help:      "Total number of config updates triggered by a user",
 		}, []string{"user"}),
@@ -185,18 +197,13 @@ func (r *DefaultMultiTenantManager) getOrCreateNotifier(userID string) (*notifie
 	nCfg, ok := r.notifiersCfg[userID]
 	if !ok {
 		amCfg := r.cfg.AlertManagerConfig
-		amOverrides := r.limits.RulerAlertManagerConfig(userID)
-		var err error
 
-		if amOverrides != nil {
-			tenantAmCfg, err := getAlertmanagerTenantConfig(r.cfg.AlertManagerConfig, *amOverrides)
-			if err != nil {
-				return nil, fmt.Errorf("failed to get alertmaanger config for tenant %s: %w", userID, err)
-			}
-
-			amCfg = tenantAmCfg
+		// Apply the tenant specific alertmanager config when defined
+		if amOverrides := r.limits.RulerAlertManagerConfig(userID); amOverrides != nil {
+			amCfg = applyAlertmanagerDefaults(*amOverrides)
 		}
 
+		var err error
 		nCfg, err = buildNotifierConfig(&amCfg, r.cfg.ExternalLabels)
 		if err != nil {
 			return nil, fmt.Errorf("failed to build notifier config for tenant %s: %w", userID, err)
@@ -208,7 +215,7 @@ func (r *DefaultMultiTenantManager) getOrCreateNotifier(userID string) (*notifie
 	}
 
 	reg := prometheus.WrapRegistererWith(prometheus.Labels{"user": userID}, r.registry)
-	reg = prometheus.WrapRegistererWithPrefix("cortex_", reg)
+	reg = prometheus.WrapRegistererWithPrefix(r.metricsNamespace+"_", reg)
 	n = newRulerNotifier(&notifier.Options{
 		QueueCapacity: r.cfg.NotificationQueueCapacity,
 		Registerer:    reg,

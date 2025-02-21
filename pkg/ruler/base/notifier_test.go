@@ -14,8 +14,8 @@ import (
 	"github.com/prometheus/prometheus/model/relabel"
 	"github.com/stretchr/testify/require"
 
-	ruler_config "github.com/grafana/loki/pkg/ruler/config"
-	"github.com/grafana/loki/pkg/util"
+	ruler_config "github.com/grafana/loki/v3/pkg/ruler/config"
+	"github.com/grafana/loki/v3/pkg/util"
 )
 
 func TestBuildNotifierConfig(t *testing.T) {
@@ -408,6 +408,66 @@ func TestBuildNotifierConfig(t *testing.T) {
 			} else {
 				require.Error(t, tt.err, err)
 			}
+		})
+	}
+}
+
+func TestApplyAlertmanagerDefaults(t *testing.T) {
+	tests := []struct {
+		name     string
+		amConfig ruler_config.AlertManagerConfig
+		want     ruler_config.AlertManagerConfig
+	}{
+		{
+			name:     "with an empty config, returns the default values",
+			amConfig: ruler_config.AlertManagerConfig{},
+			want: ruler_config.AlertManagerConfig{
+				AlertmanagerRefreshInterval: 1 * time.Minute,
+				NotificationQueueCapacity:   10000,
+				NotificationTimeout:         10 * time.Second,
+			},
+		},
+		{
+			name: "apply default values for the values that are undefined",
+			amConfig: ruler_config.AlertManagerConfig{
+				AlertmanagerURL:          "url",
+				AlertmanangerEnableV2API: true,
+				AlertmanagerDiscovery:    true,
+			},
+			want: ruler_config.AlertManagerConfig{
+				AlertmanagerURL:             "url",
+				AlertmanangerEnableV2API:    true,
+				AlertmanagerDiscovery:       true,
+				AlertmanagerRefreshInterval: 1 * time.Minute,
+				NotificationQueueCapacity:   10000,
+				NotificationTimeout:         10 * time.Second,
+			},
+		},
+		{
+			name: "do not apply default values for the values that are defined",
+			amConfig: ruler_config.AlertManagerConfig{
+				AlertmanagerURL:             "url",
+				AlertmanangerEnableV2API:    true,
+				AlertmanagerDiscovery:       true,
+				AlertmanagerRefreshInterval: 2 * time.Minute,
+				NotificationQueueCapacity:   20000,
+				NotificationTimeout:         20 * time.Second,
+			},
+			want: ruler_config.AlertManagerConfig{
+				AlertmanagerURL:             "url",
+				AlertmanangerEnableV2API:    true,
+				AlertmanagerDiscovery:       true,
+				AlertmanagerRefreshInterval: 2 * time.Minute,
+				NotificationQueueCapacity:   20000,
+				NotificationTimeout:         20 * time.Second,
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := applyAlertmanagerDefaults(tt.amConfig)
+			require.Equal(t, tt.want, result)
 		})
 	}
 }

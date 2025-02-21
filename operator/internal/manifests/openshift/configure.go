@@ -5,12 +5,13 @@ import (
 
 	"github.com/ViaQ/logerr/v2/kverrors"
 	"github.com/imdario/mergo"
-
-	lokiv1 "github.com/grafana/loki/operator/apis/loki/v1"
-	"github.com/grafana/loki/operator/internal/manifests/internal/config"
 	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/utils/ptr"
+
+	lokiv1 "github.com/grafana/loki/operator/api/loki/v1"
+	"github.com/grafana/loki/operator/internal/manifests/internal/config"
 )
 
 const (
@@ -59,17 +60,54 @@ func ConfigureGatewayDeployment(
 	mode lokiv1.ModeType,
 	secretVolumeName, tlsDir string,
 	minTLSVersion, ciphers string,
-	withTLS bool,
+	withTLS bool, adminGroups []string,
 ) error {
 	p := corev1.PodSpec{
 		ServiceAccountName: d.GetName(),
 		Containers: []corev1.Container{
-			newOPAOpenShiftContainer(mode, secretVolumeName, tlsDir, minTLSVersion, ciphers, withTLS),
+			newOPAOpenShiftContainer(mode, secretVolumeName, tlsDir, minTLSVersion, ciphers, withTLS, adminGroups),
 		},
 	}
 
 	if err := mergo.Merge(&d.Spec.Template.Spec, p, mergo.WithAppendSlice); err != nil {
 		return kverrors.Wrap(err, "failed to merge sidecar container spec ")
+	}
+
+	if mode == lokiv1.OpenshiftLogging {
+		// enable extraction of namespace selector
+		for i, c := range d.Spec.Template.Spec.Containers {
+			if c.Name != "gateway" {
+				continue
+			}
+
+			d.Spec.Template.Spec.Containers[i].Args = append(d.Spec.Template.Spec.Containers[i].Args,
+				fmt.Sprintf("--logs.auth.extract-selectors=%s", opaDefaultLabelMatcher),
+			)
+		}
+	}
+
+	return nil
+}
+
+// ConfigureGatewayDeploymentRulesAPI merges CLI argument to the gateway container
+// that allow only Rules API access with a valid namespace input for the tenant application.
+func ConfigureGatewayDeploymentRulesAPI(d *appsv1.Deployment, containerName string) error {
+	var gwIndex int
+	for i, c := range d.Spec.Template.Spec.Containers {
+		if c.Name == containerName {
+			gwIndex = i
+			break
+		}
+	}
+
+	container := corev1.Container{
+		Args: []string{
+			fmt.Sprintf("--logs.rules.label-filters=%s:%s", tenantApplication, opaDefaultLabelMatcher),
+		},
+	}
+
+	if err := mergo.Merge(&d.Spec.Template.Spec.Containers[gwIndex], container, mergo.WithAppendSlice); err != nil {
+		return kverrors.Wrap(err, "failed to merge container")
 	}
 
 	return nil
@@ -101,15 +139,15 @@ func ConfigureGatewayServiceMonitor(sm *monitoringv1.ServiceMonitor, withTLS boo
 	var opaEndpoint monitoringv1.Endpoint
 
 	if withTLS {
-		bearerTokenSecret := sm.Spec.Endpoints[0].BearerTokenSecret
+		authn := sm.Spec.Endpoints[0].Authorization
 		tlsConfig := sm.Spec.Endpoints[0].TLSConfig
 
 		opaEndpoint = monitoringv1.Endpoint{
-			Port:              opaMetricsPortName,
-			Path:              "/metrics",
-			Scheme:            "https",
-			BearerTokenSecret: bearerTokenSecret,
-			TLSConfig:         tlsConfig,
+			Port:          opaMetricsPortName,
+			Path:          "/metrics",
+			Scheme:        "https",
+			Authorization: authn,
+			TLSConfig:     tlsConfig,
 		}
 	} else {
 		opaEndpoint = monitoringv1.Endpoint{
@@ -194,14 +232,32 @@ func ConfigureRulerStatefulSet(
 }
 
 // ConfigureOptions applies default configuration for the use of the cluster monitoring alertmanager.
-func ConfigureOptions(configOpt *config.Options) error {
+func ConfigureOptions(configOpt *config.Options, am, uwam bool, token, caPath, monitorServerName string) error {
+	if am {
+		err := configureDefaultMonitoringAM(configOpt)
+		if err != nil {
+			return err
+		}
+	}
+
+	if uwam {
+		err := configureUserWorkloadAM(configOpt, token, caPath, monitorServerName)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func configureDefaultMonitoringAM(configOpt *config.Options) error {
 	if configOpt.Ruler.AlertManager == nil {
 		configOpt.Ruler.AlertManager = &config.AlertManagerConfig{}
 	}
 
 	if len(configOpt.Ruler.AlertManager.Hosts) == 0 {
 		amc := &config.AlertManagerConfig{
-			Hosts:           "https://_web._tcp.alertmanager-operated.openshift-monitoring.svc",
+			Hosts:           fmt.Sprintf("https://_web._tcp.%s.%s.svc", MonitoringSVCOperated, monitoringNamespace),
 			EnableV2:        true,
 			EnableDiscovery: true,
 			RefreshInterval: "1m",
@@ -212,5 +268,37 @@ func ConfigureOptions(configOpt *config.Options) error {
 		}
 	}
 
+	return nil
+}
+
+func configureUserWorkloadAM(configOpt *config.Options, token, caPath, monitorServerName string) error {
+	if configOpt.Overrides == nil {
+		configOpt.Overrides = map[string]config.LokiOverrides{}
+	}
+
+	lokiOverrides := configOpt.Overrides[tenantApplication]
+
+	if lokiOverrides.Ruler.AlertManager != nil {
+		return nil
+	}
+
+	lokiOverrides.Ruler.AlertManager = &config.AlertManagerConfig{
+		Hosts:           fmt.Sprintf("https://_web._tcp.%s.%s.svc", MonitoringSVCOperated, MonitoringUserWorkloadNS),
+		EnableV2:        true,
+		EnableDiscovery: true,
+		RefreshInterval: "1m",
+		Notifier: &config.NotifierConfig{
+			TLS: config.TLSConfig{
+				ServerName: ptr.To(monitorServerName),
+				CAPath:     &caPath,
+			},
+			HeaderAuth: config.HeaderAuth{
+				CredentialsFile: &token,
+				Type:            ptr.To("Bearer"),
+			},
+		},
+	}
+
+	configOpt.Overrides[tenantApplication] = lokiOverrides
 	return nil
 }

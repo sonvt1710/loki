@@ -7,13 +7,13 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/bradfitz/gomemcache/memcache"
 	"github.com/go-kit/log"
+	"github.com/grafana/gomemcache/memcache"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/atomic"
 
-	"github.com/grafana/loki/pkg/storage/chunk/cache"
+	"github.com/grafana/loki/v3/pkg/storage/chunk/cache"
 )
 
 func TestMemcached_fetchKeysBatched(t *testing.T) {
@@ -125,7 +125,7 @@ func newMockMemcacheFailing() *mockMemcacheFailing {
 	}
 }
 
-func (c *mockMemcacheFailing) GetMulti(keys []string) (map[string]*memcache.Item, error) {
+func (c *mockMemcacheFailing) GetMulti(keys []string, _ ...memcache.Option) (map[string]*memcache.Item, error) {
 	calls := c.calls.Inc()
 	if calls%3 == 0 {
 		return nil, errors.New("fail")

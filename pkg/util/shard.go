@@ -6,10 +6,20 @@ import (
 	"math"
 )
 
+// Sharding strategies & algorithms.
 const (
-	// Sharding strategies.
+	// ShardingStrategyDefault shards rule groups across available rulers in the ring.
 	ShardingStrategyDefault = "default"
+	// ShardingStrategyShuffle shards tenants' rule groups across available rulers in the ring using a
+	// shuffle-sharding algorithm.
 	ShardingStrategyShuffle = "shuffle-sharding"
+
+	// ShardingAlgoByGroup is an alias of ShardingStrategyDefault.
+	ShardingAlgoByGroup = "by-group"
+	// ShardingAlgoByRule shards all rules evenly across available rules in the ring, regardless of group.
+	// This can be achieved because currently Loki recording/alerting rules cannot not any inter-dependency, unlike
+	// Prometheus rules, so there's really no need to shard by group. This will eventually become the new default strategy.
+	ShardingAlgoByRule = "by-rule" // this will eventually become the new default strategy.
 )
 
 var (
@@ -19,7 +29,7 @@ var (
 // ShuffleShardSeed returns seed for random number generator, computed from provided identifier.
 func ShuffleShardSeed(identifier, zone string) int64 {
 	// Use the identifier to compute an hash we'll use to seed the random.
-	hasher := md5.New()
+	hasher := md5.New()               //#nosec G401 -- This does not require collision resistance, this is an intentionally predictable value
 	hasher.Write(YoloBuf(identifier)) // nolint:errcheck
 	if zone != "" {
 		hasher.Write(seedSeparator) // nolint:errcheck

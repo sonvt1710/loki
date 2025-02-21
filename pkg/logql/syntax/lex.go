@@ -11,7 +11,7 @@ import (
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/util/strutil"
 
-	"github.com/grafana/loki/pkg/logqlmodel"
+	"github.com/grafana/loki/v3/pkg/logqlmodel"
 )
 
 var tokens = map[string]int{
@@ -23,8 +23,10 @@ var tokens = map[string]int{
 	OpTypeNEQ:      NEQ,
 	"=~":           RE,
 	"!~":           NRE,
+	"!>":           NPA,
 	"|=":           PIPE_EXACT,
 	"|~":           PIPE_MATCH,
+	"|>":           PIPE_PATTERN,
 	OpPipe:         PIPE,
 	OpUnwrap:       UNWRAP,
 	"(":            OPEN_PARENTHESIS,
@@ -72,6 +74,21 @@ var tokens = map[string]int{
 	// filter functions
 	OpFilterIP:   IP,
 	OpDecolorize: DECOLORIZE,
+
+	// drop labels
+	OpDrop: DROP,
+
+	// keep labels
+	OpKeep: KEEP,
+
+	// variants
+	OpVariants: VARIANTS,
+	VariantsOf: OF,
+}
+
+var parserFlags = map[string]struct{}{
+	OpStrict:    {},
+	OpKeepEmpty: {},
 }
 
 // functionTokens are tokens that needs to be suffixes with parenthesis
@@ -104,7 +121,11 @@ var functionTokens = map[string]int{
 	OpTypeStdvar:   STDVAR,
 	OpTypeBottomK:  BOTTOMK,
 	OpTypeTopK:     TOPK,
+	OpTypeSort:     SORT,
+	OpTypeSortDesc: SORT_DESC,
 	OpLabelReplace: LABEL_REPLACE,
+
+	OpTypeApproxTopK: APPROX_TOPK,
 
 	// conversion Op
 	OpConvBytes:           BYTES_CONV,
@@ -116,17 +137,18 @@ var functionTokens = map[string]int{
 }
 
 type lexer struct {
-	scanner.Scanner
+	Scanner
 	errs    []logqlmodel.ParseError
 	builder strings.Builder
 }
 
-func (l *lexer) Lex(lval *exprSymType) int {
+func (l *lexer) Lex(lval *syntaxSymType) int {
 	r := l.Scan()
 
 	switch r {
 	case '#':
 		// Scan until a newline or EOF is encountered
+		//nolint:revive
 		for next := l.Peek(); !(next == '\n' || next == scanner.EOF); next = l.Next() {
 		}
 
@@ -140,7 +162,7 @@ func (l *lexer) Lex(lval *exprSymType) int {
 
 		duration, ok := tryScanDuration(numberText, &l.Scanner)
 		if ok {
-			lval.duration = duration
+			lval.dur = duration
 			return DURATION
 		}
 
@@ -152,6 +174,19 @@ func (l *lexer) Lex(lval *exprSymType) int {
 
 		lval.str = numberText
 		return NUMBER
+	case '-': // handle flags and negative durations
+		if l.Peek() == '-' {
+			if flag, ok := tryScanFlag(&l.Scanner); ok {
+				lval.str = flag
+				return FUNCTION_FLAG
+			}
+		}
+
+		tokenText := l.TokenText()
+		if duration, ok := tryScanDuration(tokenText, &l.Scanner); ok {
+			lval.dur = duration
+			return DURATION
+		}
 
 	case scanner.String, scanner.RawString:
 		var err error
@@ -178,7 +213,7 @@ func (l *lexer) Lex(lval *exprSymType) int {
 					l.Error(err.Error())
 					return 0
 				}
-				lval.duration = time.Duration(i)
+				lval.dur = time.Duration(i)
 				return RANGE
 			}
 			_, _ = l.builder.WriteRune(r)
@@ -188,7 +223,9 @@ func (l *lexer) Lex(lval *exprSymType) int {
 	}
 
 	tokenText := l.TokenText()
-	tokenNext := tokenText + string(l.Peek())
+	tokenTextLower := strings.ToLower(l.TokenText())
+	tokenNext := strings.ToLower(tokenText + string(l.Peek()))
+
 	if tok, ok := functionTokens[tokenNext]; ok {
 		// create a copy to advance to the entire token for testing suffix
 		sc := l.Scanner
@@ -199,7 +236,7 @@ func (l *lexer) Lex(lval *exprSymType) int {
 		}
 	}
 
-	if tok, ok := functionTokens[tokenText]; ok {
+	if tok, ok := functionTokens[tokenTextLower]; ok {
 		if !isFunction(l.Scanner) {
 			lval.str = tokenText
 			return IDENTIFIER
@@ -212,7 +249,7 @@ func (l *lexer) Lex(lval *exprSymType) int {
 		return tok
 	}
 
-	if tok, ok := tokens[tokenText]; ok {
+	if tok, ok := tokens[tokenTextLower]; ok {
 		return tok
 	}
 
@@ -224,7 +261,36 @@ func (l *lexer) Error(msg string) {
 	l.errs = append(l.errs, logqlmodel.NewParseError(msg, l.Line, l.Column))
 }
 
-func tryScanDuration(number string, l *scanner.Scanner) (time.Duration, bool) {
+// tryScanFlag scans for a parser flag and returns it on success
+// it advances the scanner only if a valid flag is found
+func tryScanFlag(l *Scanner) (string, bool) {
+	var sb strings.Builder
+	sb.WriteString(l.TokenText())
+
+	// copy the scanner to avoid advancing it in case it's not a flag
+	s := *l
+	consumed := 0
+	for r := s.Peek(); unicode.IsLetter(r) || r == '-'; r = s.Peek() {
+		_, _ = sb.WriteRune(r)
+		_ = s.Next()
+
+		consumed++
+	}
+
+	flag := sb.String()
+	if _, ok := parserFlags[flag]; !ok {
+		return "", false
+	}
+
+	// consume the scanner
+	for i := 0; i < consumed; i++ {
+		_ = l.Next()
+	}
+
+	return flag, true
+}
+
+func tryScanDuration(number string, l *Scanner) (time.Duration, bool) {
 	var sb strings.Builder
 	sb.WriteString(number)
 	// copy the scanner to avoid advancing it in case it's not a duration.
@@ -286,7 +352,7 @@ func isDurationRune(r rune) bool {
 	}
 }
 
-func tryScanBytes(number string, l *scanner.Scanner) (uint64, bool) {
+func tryScanBytes(number string, l *Scanner) (uint64, bool) {
 	var sb strings.Builder
 	sb.WriteString(number)
 	// copy the scanner to avoid advancing it in case it's not a duration.
@@ -329,12 +395,12 @@ func isBytesSizeRune(r rune) bool {
 
 // isFunction check if the next runes are either an open parenthesis
 // or by/without tokens. This allows to dissociate functions and identifier correctly.
-func isFunction(sc scanner.Scanner) bool {
+func isFunction(sc Scanner) bool {
 	var sb strings.Builder
 	sc = trimSpace(sc)
 	for r := sc.Next(); r != scanner.EOF; r = sc.Next() {
 		sb.WriteRune(r)
-		switch sb.String() {
+		switch strings.ToLower(sb.String()) {
 		case "(":
 			return true
 		case "by", "without":
@@ -345,7 +411,7 @@ func isFunction(sc scanner.Scanner) bool {
 	return false
 }
 
-func trimSpace(l scanner.Scanner) scanner.Scanner {
+func trimSpace(l Scanner) Scanner {
 	for n := l.Peek(); n != scanner.EOF; n = l.Peek() {
 		if unicode.IsSpace(n) {
 			l.Next()

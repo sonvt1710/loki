@@ -9,9 +9,9 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/grafana/loki/clients/pkg/promtail/api"
+	"github.com/grafana/loki/v3/clients/pkg/promtail/api"
 
-	"github.com/grafana/loki/pkg/logproto"
+	"github.com/grafana/loki/v3/pkg/logproto"
 )
 
 func TestBatch_MaxStreams(t *testing.T) {
@@ -58,8 +58,9 @@ func TestBatch_add(t *testing.T) {
 			inputEntries: []api.Entry{
 				{Labels: model.LabelSet{}, Entry: logEntries[0].Entry},
 				{Labels: model.LabelSet{}, Entry: logEntries[1].Entry},
+				{Labels: model.LabelSet{}, Entry: logEntries[7].Entry},
 			},
-			expectedSizeBytes: len(logEntries[0].Entry.Line) + len(logEntries[1].Entry.Line),
+			expectedSizeBytes: entrySize(logEntries[0]) + entrySize(logEntries[0]) + entrySize(logEntries[7]),
 		},
 		"multiple streams with multiple log entries": {
 			inputEntries: []api.Entry{
@@ -72,8 +73,6 @@ func TestBatch_add(t *testing.T) {
 	}
 
 	for testName, testData := range tests {
-		testData := testData
-
 		t.Run(testName, func(t *testing.T) {
 			b := newBatch(0)
 
@@ -122,8 +121,6 @@ func TestBatch_encode(t *testing.T) {
 	}
 
 	for testName, testData := range tests {
-		testData := testData
-
 		t.Run(testName, func(t *testing.T) {
 			t.Parallel()
 
@@ -163,4 +160,24 @@ func TestHashCollisions(t *testing.T) {
 		assert.Equal(t, ls2.String(), req.Streams[0].Labels)
 		assert.Equal(t, ls1.String(), req.Streams[1].Labels)
 	}
+}
+
+// store the result to a package level variable
+// so the compiler cannot eliminate the Benchmark itself.
+var result string
+
+func BenchmarkLabelsMapToString(b *testing.B) {
+	labelSet := make(model.LabelSet)
+	labelSet["label"] = "value"
+	labelSet["label1"] = "value2"
+	labelSet["label2"] = "value3"
+	labelSet["__tenant_id__"] = "another_value"
+
+	b.ResetTimer()
+	var r string
+	for i := 0; i < b.N; i++ {
+		// store in r prevent the compiler eliminating the function call.
+		r = labelsMapToString(labelSet, ReservedLabelTenantID)
+	}
+	result = r
 }

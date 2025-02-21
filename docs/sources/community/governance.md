@@ -1,5 +1,7 @@
 ---
 title: Governance
+description: Describes the governance of the Loki open source project.
+weight: 300  
 ---
 # Governance
 
@@ -23,7 +25,7 @@ The Loki developers and community are expected to follow the values defined in t
 
 ## Projects
 
-Each project must have a [`MAINTAINERS.md`][maintainers] file with at least one maintainer. Where a project has a release process, access and documentation should be such that more than one person can perform a release. Releases should be announced on the [announcemount][announce] and [users][users] mailing lists. Any new projects should be first proposed on the [team mailing list][team] following the voting procedures listed below.
+Each project must have a [`MAINTAINERS.md`][maintainers] file with at least one maintainer. Where a project has a release process, access and documentation should be such that more than one person can perform a release. Releases should be announced on the [announcement][announce] and [users][users] mailing lists. Any new projects should be first proposed on the [team mailing list][team] following the voting procedures listed below.
 
 ## Decision making
 
@@ -48,30 +50,36 @@ Upon death of a member, they leave the team automatically.
 In case a member leaves, the [offboarding](#offboarding) procedure is applied.
 
 The current team members are:
-
+<!-- vale Grafana.GrafanaSpelling = NO -->
 - Aditya C S - [adityacs](https://github.com/adityacs)
-- Cyril Tovena - [cyriltovena](https://github.com/cyriltovena) ([Grafana Labs](https://grafana.com/))
-- Danny Kopping - [dannykopping](https://github.com/dannykopping) ([Grafana Labs](https://grafana.com/))
-- David Kaltschmidt - [davkal](https://github.com/davkal) ([Grafana Labs](https://grafana.com/))
-- Edward Welch - [slim-bean](https://github.com/slim-bean) ([Grafana Labs](https://grafana.com/))
-- Goutham Veeramachaneni - [gouthamve](https://github.com/gouthamve) ([Grafana Labs](https://grafana.com/))
-- Joe Elliott - [joe-elliott](https://github.com/joe-elliott) ([Grafana Labs](https://grafana.com/))
-- Karsten Jeschkies - [jeschkies](https://github.com/jeschkies) ([Grafana Labs](https://grafana.com/))
-- Kaviraj Kanagaraj - [kavirajk](https://github.com/kavirajk) ([Grafana Labs](https://grafana.com/))
+- Ashwanth Goli - [ashwanthgoli](https://github.com/ashwanthgoli) ([Grafana Labs](/))
+- Cyril Tovena - [cyriltovena](https://github.com/cyriltovena) ([Grafana Labs](/))
+- Danny Kopping - [dannykopping](https://github.com/dannykopping) ([Grafana Labs](/))
+- David Kaltschmidt - [davkal](https://github.com/davkal) ([Grafana Labs](/))
+- Dylan Guedes - [dylanguedes](https://github.com/dylanguedes) ([Grafana Labs](/))
+- Edward Welch - [slim-bean](https://github.com/slim-bean) ([Grafana Labs](/))
+- Goutham Veeramachaneni - [gouthamve](https://github.com/gouthamve) ([Grafana Labs](/))
+- Joe Elliott - [joe-elliott](https://github.com/joe-elliott) ([Grafana Labs](/))
+- Karsten Jeschkies - [jeschkies](https://github.com/jeschkies) ([Grafana Labs](/))
+- Kaviraj Kanagaraj - [kavirajk](https://github.com/kavirajk) ([Grafana Labs](/))
 - Li Guozhong - [liguozhong](https://github.com/liguozhong) ([Alibaba Cloud](https://alibabacloud.com/))
-- Owen Diehl - [owen-d](https://github.com/owen-d) ([Grafana Labs](https://grafana.com/))
+- Michel Hollands - [michelhollands](https://github.com/michelhollands) ([Grafana Labs](/))
+- Owen Diehl - [owen-d](https://github.com/owen-d) ([Grafana Labs](/))
 - Periklis Tsirakidis - [periklis](https://github.com/periklis) ([Red Hat](https://www.redhat.com/))
-- Sandeep Sukhani - [sandeepsukhani](https://github.com/sandeepsukhani) ([Grafana Labs](https://grafana.com/))
-- Tom Braack - [sh0rez](https://github.com/sh0rez) ([Grafana Labs](https://grafana.com/))
-- Tom Wilkie - [tomwilkie](https://github.com/tomwilkie) ([Grafana Labs](https://grafana.com/))
+- Salva Corts - [salvacorts](https://github.com/salvacorts) ([Grafana Labs](/))
+- Sandeep Sukhani - [sandeepsukhani](https://github.com/sandeepsukhani) ([Grafana Labs](/))
+- Susana Ferreira - [ssncferreira](https://github.com/ssncferreira)
+- Tom Braack - [sh0rez](https://github.com/sh0rez) ([Grafana Labs](/))
+- Tom Wilkie - [tomwilkie](https://github.com/tomwilkie) ([Grafana Labs](/))
 
 The current Loki SIG Operator team members are:
+
 - Brett Jones - [blockloop](https://github.com/blockloop/) ([InVision](https://www.invisionapp.com/))
-- Cyril Tovena - [cyriltovena](https://github.com/cyriltovena) ([Grafana Labs](https://grafana.com/))
+- Cyril Tovena - [cyriltovena](https://github.com/cyriltovena) ([Grafana Labs](/))
 - Gerard Vanloo - [Red-GV](https://github.com/Red-GV) ([IBM](https://www.ibm.com))
 - Periklis Tsirakidis - [periklis](https://github.com/periklis) ([Red Hat](https://www.redhat.com))
 - Sashank Agrawal - [sasagarw](https://github.com/sasagarw/) ([Red Hat](https://www.redhat.com))
-
+<!-- vale Grafana.GrafanaSpelling = YES -->
 ### Maintainers
 
 Maintainers lead one or more project(s) or parts thereof and serve as a point of conflict resolution amongst the contributors to this project. Ideally, maintainers are also team members, but exceptions are possible for suitable maintainers that, for whatever reason, are not yet team members.
@@ -154,7 +162,6 @@ The new member is
 - announced on the [developers mailing list][devs] by an existing team member. Ideally, the new member replies in this thread, acknowledging team membership.
 - added to the projects with commit rights.
 - added to the [team mailing list][team].
-
 
 ### Offboarding
 

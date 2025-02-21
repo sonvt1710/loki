@@ -6,11 +6,14 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 
-	"github.com/grafana/loki/pkg/util/flagext"
+	"github.com/grafana/loki/v3/pkg/util/constants"
+	"github.com/grafana/loki/v3/pkg/util/flagext"
 )
 
 const (
-	ReasonLabel = "reason"
+	ReasonLabel            = "reason"
+	MissingStreamsErrorMsg = "error at least one valid stream is required for ingestion"
+
 	// InvalidLabels is a reason for discarding log lines which have labels that cannot be parsed.
 	InvalidLabels = "invalid_labels"
 	MissingLabels = "missing_labels"
@@ -27,12 +30,21 @@ const (
 	// StreamLimit is a reason for discarding lines when we can't create a new stream
 	// because the limit of active streams has been reached.
 	StreamLimit         = "stream_limit"
-	StreamLimitErrorMsg = "Maximum active stream limit exceeded, reduce the number of active streams (reduce labels or reduce label values), or contact your Loki administrator to see if the limit can be increased"
+	StreamLimitErrorMsg = "Maximum active stream limit exceeded when trying to create stream %s, reduce the number of active streams (reduce labels or reduce label values), or contact your Loki administrator to see if the limit can be increased, user: '%s'"
 	// StreamRateLimit is a reason for discarding lines when the streams own rate limit is hit
 	// rather than the overall ingestion rate limit.
 	StreamRateLimit = "per_stream_rate_limit"
-	OutOfOrder      = "out_of_order"
-	TooFarBehind    = "too_far_behind"
+	// OutOfOrder is a reason for discarding lines when Loki doesn't accept out
+	// of order log lines (parameter `-ingester.unordered-writes` is set to
+	// `false`) and the lines in question are older than the newest line in the
+	// stream.
+	OutOfOrder = "out_of_order"
+	// TooFarBehind is a reason for discarding lines when Loki accepts
+	// unordered ingest  (parameter `-ingester.unordered-writes` is set to
+	// `true`, which is the default) and the lines in question are older than
+	// half of `-ingester.max-chunk-age` compared to the newest line in the
+	// stream.
+	TooFarBehind = "too_far_behind"
 	// GreaterThanMaxSampleAge is a reason for discarding log lines which are older than the current time - `reject_old_samples_max_age`
 	GreaterThanMaxSampleAge         = "greater_than_max_sample_age"
 	GreaterThanMaxSampleAgeErrorMsg = "entry for stream '%s' has timestamp too old: %v, oldest acceptable timestamp is: %v"
@@ -49,8 +61,20 @@ const (
 	LabelValueTooLong         = "label_value_too_long"
 	LabelValueTooLongErrorMsg = "stream '%s' has label value too long: '%s'"
 	// DuplicateLabelNames is a reason for discarding a log line which has duplicate label names
-	DuplicateLabelNames         = "duplicate_label_names"
-	DuplicateLabelNamesErrorMsg = "stream '%s' has duplicate label name: '%s'"
+	DuplicateLabelNames                  = "duplicate_label_names"
+	DuplicateLabelNamesErrorMsg          = "stream '%s' has duplicate label name: '%s'"
+	DisallowedStructuredMetadata         = "disallowed_structured_metadata"
+	DisallowedStructuredMetadataErrorMsg = "stream '%s' includes structured metadata, but this feature is disallowed. Please see `limits_config.allow_structured_metadata` or contact your Loki administrator to enable it."
+	StructuredMetadataTooLarge           = "structured_metadata_too_large"
+	StructuredMetadataTooLargeErrorMsg   = "stream '%s' has structured metadata too large: '%d' bytes, limit: '%d' bytes. Please see `limits_config.max_structured_metadata_size` or contact your Loki administrator to increase it."
+	StructuredMetadataTooMany            = "structured_metadata_too_many"
+	StructuredMetadataTooManyErrorMsg    = "stream '%s' has too many structured metadata labels: '%d', limit: '%d'. Please see `limits_config.max_structured_metadata_entries_count` or contact your Loki administrator to increase it."
+	BlockedIngestion                     = "blocked_ingestion"
+	BlockedIngestionErrorMsg             = "ingestion blocked for user %s until '%s' with status code '%d'"
+	BlockedIngestionPolicy               = "blocked_ingestion_policy"
+	BlockedIngestionPolicyErrorMsg       = "ingestion blocked for user %s until '%s' with status code '%d'"
+	MissingEnforcedLabels                = "missing_enforced_labels"
+	MissingEnforcedLabelsErrorMsg        = "missing required labels %s for user %s for stream %s"
 )
 
 type ErrStreamRateLimit struct {
@@ -69,7 +93,7 @@ func (e *ErrStreamRateLimit) Error() string {
 // MutatedSamples is a metric of the total number of lines mutated, by reason.
 var MutatedSamples = promauto.NewCounterVec(
 	prometheus.CounterOpts{
-		Namespace: "loki",
+		Namespace: constants.Loki,
 		Name:      "mutated_samples_total",
 		Help:      "The total number of samples that have been mutated.",
 	},
@@ -79,7 +103,7 @@ var MutatedSamples = promauto.NewCounterVec(
 // MutatedBytes is a metric of the total mutated bytes, by reason.
 var MutatedBytes = promauto.NewCounterVec(
 	prometheus.CounterOpts{
-		Namespace: "loki",
+		Namespace: constants.Loki,
 		Name:      "mutated_bytes_total",
 		Help:      "The total number of bytes that have been mutated.",
 	},
@@ -89,25 +113,25 @@ var MutatedBytes = promauto.NewCounterVec(
 // DiscardedBytes is a metric of the total discarded bytes, by reason.
 var DiscardedBytes = promauto.NewCounterVec(
 	prometheus.CounterOpts{
-		Namespace: "loki",
+		Namespace: constants.Loki,
 		Name:      "discarded_bytes_total",
 		Help:      "The total number of bytes that were discarded.",
 	},
-	[]string{ReasonLabel, "tenant"},
+	[]string{ReasonLabel, "tenant", "retention_hours", "policy"},
 )
 
 // DiscardedSamples is a metric of the number of discarded samples, by reason.
 var DiscardedSamples = promauto.NewCounterVec(
 	prometheus.CounterOpts{
-		Namespace: "loki",
+		Namespace: constants.Loki,
 		Name:      "discarded_samples_total",
 		Help:      "The total number of samples that were discarded.",
 	},
-	[]string{ReasonLabel, "tenant"},
+	[]string{ReasonLabel, "tenant", "retention_hours", "policy"},
 )
 
 var LineLengthHist = promauto.NewHistogram(prometheus.HistogramOpts{
-	Namespace: "loki",
+	Namespace: constants.Loki,
 	Name:      "bytes_per_line",
 	Help:      "The total number of bytes per line.",
 	Buckets:   prometheus.ExponentialBuckets(1, 8, 8), // 1B -> 16MB

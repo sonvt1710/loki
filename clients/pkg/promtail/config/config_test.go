@@ -11,9 +11,9 @@ import (
 	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v2"
 
-	"github.com/grafana/loki/clients/pkg/promtail/client"
+	"github.com/grafana/loki/v3/clients/pkg/promtail/client"
 
-	"github.com/grafana/loki/pkg/util/flagext"
+	"github.com/grafana/loki/v3/pkg/util/flagext"
 )
 
 const testFile = `
@@ -37,14 +37,65 @@ scrape_configs:
 limits_config:
   readline_rate: 100
   readline_burst: 200
-options:
-  stream_lag_labels: foo
+`
+
+const headersTestFile = `
+clients:
+  - name: custom-headers
+    url: https://1:shh@example.com/loki/api/v1/push
+    headers:
+      name: value
+`
+
+const testDuplicateJobsName = `
+clients:
+  - external_labels:
+      cluster: dev1
+    url: https://1:shh@example.com/loki/api/v1/push
+  - external_labels:
+      cluster: prod1
+    url: https://1:shh@example.com/loki/api/v1/push
+scrape_configs:
+  - job_name: kubernetes-pods-name
+    kubernetes_sd_configs:
+      - role: pod
+  - job_name: system
+    static_configs:
+    - targets:
+      - localhost
+      labels:
+        job: varlogs
+  - job_name: system
+    static_configs:
+    - targets:
+      - localhost
+      labels:
+        job: varlogs2
+limits_config:
+  readline_rate: 100
+  readline_burst: 200
 `
 
 func Test_Load(t *testing.T) {
 	var dst Config
 	err := yaml.Unmarshal([]byte(testFile), &dst)
 	require.Nil(t, err)
+}
+
+func Test_Load_DuplicateJobsName(t *testing.T) {
+	var dst Config
+	err := yaml.Unmarshal([]byte(testDuplicateJobsName), &dst)
+	require.ErrorContains(t, err, `found multiple scrape configs with job name "system"`)
+}
+
+func TestHeadersConfigLoad(t *testing.T) {
+	var dst Config
+	err := yaml.Unmarshal([]byte(headersTestFile), &dst)
+	require.Nil(t, err)
+
+	for _, clientConfig := range dst.ClientConfigs {
+		require.Equal(t, map[string]string{"name": "value"}, clientConfig.Headers)
+	}
 }
 
 func Test_RateLimitLoad(t *testing.T) {
@@ -74,9 +125,6 @@ func TestConfig_Setup(t *testing.T) {
 						ExternalLabels: flagext.LabelSet{LabelSet: model.LabelSet{"client2": "2"}},
 					},
 				},
-				Options: Options{
-					StreamLagLabels: []string{},
-				},
 			},
 			Config{
 				ClientConfig: client.Config{
@@ -89,9 +137,6 @@ func TestConfig_Setup(t *testing.T) {
 					{
 						ExternalLabels: flagext.LabelSet{LabelSet: model.LabelSet{"client2": "2", "foo": "bar"}},
 					},
-				},
-				Options: Options{
-					StreamLagLabels: []string{},
 				},
 			},
 		},
@@ -108,9 +153,6 @@ func TestConfig_Setup(t *testing.T) {
 					{
 						ExternalLabels: flagext.LabelSet{LabelSet: model.LabelSet{"client2": "2"}},
 					},
-				},
-				Options: Options{
-					StreamLagLabels: []string{},
 				},
 			},
 			Config{
@@ -130,13 +172,9 @@ func TestConfig_Setup(t *testing.T) {
 						URL:            dskitflagext.URLValue{URL: mustURL("http://foo")},
 					},
 				},
-				Options: Options{
-					StreamLagLabels: []string{},
-				},
 			},
 		},
 	} {
-		tt := tt
 		t.Run(fmt.Sprintf("%d", i), func(t *testing.T) {
 			tt.in.Setup(log.NewNopLogger())
 			require.Equal(t, tt.expected, tt.in)

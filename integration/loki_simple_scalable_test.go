@@ -1,3 +1,5 @@
+//go:build integration
+
 package integration
 
 import (
@@ -8,27 +10,37 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/grafana/loki/integration/client"
-	"github.com/grafana/loki/integration/cluster"
+	"github.com/grafana/loki/v3/integration/client"
+	"github.com/grafana/loki/v3/integration/cluster"
 )
 
-func TestSimpleScalableIngestQuery(t *testing.T) {
-	clu := cluster.New()
+func TestSimpleScalable_IngestQuery(t *testing.T) {
+	clu := cluster.New(nil, cluster.SchemaWithTSDB, func(c *cluster.Cluster) {
+		c.SetSchemaVer("v13")
+	})
 	defer func() {
 		assert.NoError(t, clu.Cleanup())
 	}()
 
 	var (
-		tRead = clu.AddComponent(
-			"read",
-			"-target=read",
-		)
 		tWrite = clu.AddComponent(
 			"write",
 			"-target=write",
 		)
+		tBackend = clu.AddComponent(
+			"backend",
+			"-target=backend",
+			"-legacy-read-mode=false",
+		)
 	)
+	require.NoError(t, clu.Run())
 
+	tRead := clu.AddComponent(
+		"read",
+		"-target=read",
+		"-common.compactor-address="+tBackend.HTTPURL(),
+		"-legacy-read-mode=false",
+	)
 	require.NoError(t, clu.Run())
 
 	tenantID := randStringRunes()
@@ -38,14 +50,16 @@ func TestSimpleScalableIngestQuery(t *testing.T) {
 	cliWrite.Now = now
 	cliRead := client.New(tenantID, "", tRead.HTTPURL())
 	cliRead.Now = now
+	cliBackend := client.New(tenantID, "", tBackend.HTTPURL())
+	cliBackend.Now = now
 
 	t.Run("ingest logs", func(t *testing.T) {
 		// ingest some log lines
-		require.NoError(t, cliWrite.PushLogLineWithTimestamp("lineA", now.Add(-45*time.Minute), map[string]string{"job": "fake"}))
-		require.NoError(t, cliWrite.PushLogLineWithTimestamp("lineB", now.Add(-45*time.Minute), map[string]string{"job": "fake"}))
+		require.NoError(t, cliWrite.PushLogLine("lineA", now.Add(-45*time.Minute), nil, map[string]string{"job": "fake"}))
+		require.NoError(t, cliWrite.PushLogLine("lineB", now.Add(-45*time.Minute), nil, map[string]string{"job": "fake"}))
 
-		require.NoError(t, cliWrite.PushLogLine("lineC", map[string]string{"job": "fake"}))
-		require.NoError(t, cliWrite.PushLogLine("lineD", map[string]string{"job": "fake"}))
+		require.NoError(t, cliWrite.PushLogLine("lineC", now, nil, map[string]string{"job": "fake"}))
+		require.NoError(t, cliWrite.PushLogLine("lineD", now, nil, map[string]string{"job": "fake"}))
 	})
 
 	t.Run("query", func(t *testing.T) {
